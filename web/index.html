@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>llm-gateway 控制台</title>
+<style>
+  :root {
+    --bg: #1e1e2e;
+    --panel: #272735;
+    --panel2: #2f2f40;
+    --border: #3a3a4d;
+    --text: #e4e4ef;
+    --muted: #9a9ab0;
+    --accent: #4f9cf9;
+    --green: #3fb96a;
+    --red: #e5534b;
+    --yellow: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 20px;
+    max-width: 1080px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+  h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 20px; flex-wrap: wrap; gap: 10px;
+  }
+  .topbar .actions { display: flex; gap: 8px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; margin-bottom: 20px;
+  }
+  button {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { opacity: 0.9; }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: transparent; border: 1px solid var(--red); color: var(--red); }
+  button.small { padding: 4px 10px; font-size: 12px; }
+  input, select {
+    background: var(--panel2); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 7px 10px; font-size: 13px; width: 100%;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .field { margin-bottom: 10px; }
+  .row { display: flex; gap: 12px; }
+  .row .field { flex: 1; }
+  .upstream-card {
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 14px; margin-bottom: 12px;
+  }
+  .upstream-head {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+    justify-content: space-between;
+  }
+  .upstream-head .name { font-weight: 600; font-size: 14px; }
+  .badge {
+    font-size: 11px; padding: 2px 8px; border-radius: 10px; background: var(--panel);
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 4px; }
+  .dot.ok { background: var(--green); }
+  .dot.fail { background: var(--red); }
+  .dot.unknown { background: var(--muted); }
+  .proto-tag { font-size: 11px; padding: 2px 8px; border-radius: 4px; }
+  .proto-openai { background: #1a3a5c; color: #6db3ff; }
+  .proto-anthropic { background: #3c2a1a; color: #e8a95c; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .status-badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; }
+  .status-200 { background: #1a3a2c; color: var(--green); }
+  .status-err { background: #3a1a1a; color: var(--red); }
+  .toast {
+    position: fixed; bottom: 20px; right: 20px; padding: 12px 18px; border-radius: 8px;
+    color: #fff; font-size: 13px; opacity: 0; transition: opacity .3s; pointer-events: none;
+  }
+  .toast.show { opacity: 1; }
+  .toast.ok { background: var(--green); }
+  .toast.err { background: var(--red); }
+  .muted { color: var(--muted); }
+  .mono { font-family: "Cascadia Code", Consolas, monospace; }
+  .key-wrap { display: flex; gap: 6px; }
+  .key-wrap input { flex: 1; }
+  .key-wrap button { flex-shrink: 0; }
+  .log-empty { color: var(--muted); text-align: center; padding: 20px; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div>
+    <h1>llm-gateway 控制台</h1>
+    <div class="sub">本地多模型 API 网关 · OpenAI ↔ Anthropic 双向互转</div>
+  </div>
+  <div class="actions">
+    <button class="ghost" onclick="checkHealth()">健康检查</button>
+    <button class="ghost" onclick="loadLogs()">刷新日志</button>
+    <button onclick="saveConfig()">保存全部</button>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>监听设置</h2>
+  <div class="row">
+    <div class="field">
+      <label>监听地址</label>
+      <input id="listen-host" placeholder="127.0.0.1">
+    </div>
+    <div class="field">
+      <label>监听端口</label>
+      <input id="listen-port" type="number" placeholder="8318">
+    </div>
+  </div>
+  <div class="muted" style="font-size:12px;">修改监听设置后需重启网关才能生效（保存仅写入配置文件）。</div>
+</div>
+
+<div class="panel">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+    <h2 style="margin:0;">上游服务</h2>
+    <button class="ghost small" onclick="addUpstream()">+ 添加上游</button>
+  </div>
+  <div id="upstreams"></div>
+</div>
+
+<div class="panel">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+    <h2 style="margin:0;">模型路由</h2>
+    <button class="ghost small" onclick="addRoute()">+ 添加路由</button>
+  </div>
+  <div class="muted" style="font-size:12px;margin-bottom:12px;">将模型名显式绑定到某个上游（留空则按上游的模型列表自动匹配）。</div>
+  <div id="routes"></div>
+</div>
+
+<div class="panel">
+  <h2>请求日志</h2>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <span class="muted" style="font-size:12px;">最近 300 条</span>
+    <button class="ghost small" onclick="clearLogs()">清空</button>
+  </div>
+  <div id="logs"><div class="log-empty">暂无请求</div></div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let config = null;
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  return res.json();
+}
+
+function toast(msg, ok = true) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (ok ? 'ok' : 'err');
+  setTimeout(() => t.className = 'toast', 2500);
+}
+
+async function loadConfig() {
+  config = await api('/api/config');
+  document.getElementById('listen-host').value = config.listen.host;
+  document.getElementById('listen-port').value = config.listen.port;
+  renderUpstreams();
+  renderRoutes();
+}
+
+function protoTag(p) {
+  return p === 'anthropic'
+    ? '<span class="proto-tag proto-anthropic">Anthropic</span>'
+    : '<span class="proto-tag proto-openai">OpenAI</span>';
+}
+
+function renderUpstreams() {
+  const box = document.getElementById('upstreams');
+  box.innerHTML = '';
+  config.upstreams.forEach((up, i) => {
+    const card = document.createElement('div');
+    card.className = 'upstream-card';
+    card.innerHTML = `
+      <div class="upstream-head">
+        <div style="display:flex;align-items:center;gap:8px;">
+          <span class="dot unknown" id="dot-${i}"></span>
+          <span class="name">${esc(up.name)}</span>
+          ${protoTag(up.protocol)}
+          <span class="badge">${up.models.length} 个模型</span>
+        </div>
+        <div style="display:flex;gap:6px;">
+          <button class="ghost small" onclick="testUpstream(${i})">测试</button>
+          <button class="danger small" onclick="delUpstream(${i})">删除</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>名称</label>
+          <input value="${esc(up.name)}" oninput="config.upstreams[${i}].name=this.value">
+        </div>
+        <div class="field">
+          <label>协议</label>
+          <select onchange="config.upstreams[${i}].protocol=this.value">
+            <option value="openai" ${up.protocol==='openai'?'selected':''}>openai</option>
+            <option value="anthropic" ${up.protocol==='anthropic'?'selected':''}>anthropic</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label>Base URL</label>
+        <input class="mono" value="${esc(up.base_url)}" oninput="config.upstreams[${i}].base_url=this.value">
+      </div>
+      <div class="field">
+        <label>API Key</label>
+        <div class="key-wrap">
+          <input type="password" class="mono" value="${esc(up.api_key)}" oninput="config.upstreams[${i}].api_key=this.value">
+          <button class="ghost small" onclick="toggleKey(this)">显示</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>模型列表（逗号分隔）</label>
+        <input class="mono" value="${esc(up.models.join(', '))}" oninput="config.upstreams[${i}].models=this.value.split(',').map(s=>s.trim()).filter(Boolean)">
+      </div>
+    `;
+    box.appendChild(card);
+  });
+}
+
+function renderRoutes() {
+  const box = document.getElementById('routes');
+  box.innerHTML = '';
+  const entries = Object.entries(config.routes || {});
+  if (entries.length === 0) {
+    box.innerHTML = '<div class="muted" style="font-size:12px;">暂无显式路由，将按模型列表自动匹配。</div>';
+    return;
+  }
+  entries.forEach(([model, up], i) => {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.style.marginBottom = '8px';
+    row.innerHTML = `
+      <div class="field">
+        <label>模型名</label>
+        <input class="mono" value="${esc(model)}" oninput="updateRouteKey(${i}, this.value)">
+      </div>
+      <div class="field">
+        <label>上游</label>
+        <select onchange="config.routes[Object.keys(config.routes)[${i}]]=this.value">
+          ${config.upstreams.map(u => `<option value="${esc(u.name)}" ${u.name===up?'selected':''}>${esc(u.name)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="field" style="flex:0 0 auto;">
+        <label>&nbsp;</label>
+        <button class="danger small" onclick="delRoute(${i})">删除</button>
+      </div>
+    `;
+    box.appendChild(row);
+  });
+}
+
+function updateRouteKey(i, newKey) {
+  const entries = Object.entries(config.routes);
+  const oldKey = entries[i][0];
+  const val = entries[i][1];
+  const newRoutes = {};
+  entries.forEach(([k, v], idx) => { newRoutes[idx === i ? newKey : k] = v; });
+  config.routes = newRoutes;
+}
+
+function addUpstream() {
+  config.upstreams.push({ name: 'new-upstream', protocol: 'openai', base_url: 'https://api.openai.com/v1', api_key: 'sk-', models: ['gpt-4o'] });
+  renderUpstreams();
+}
+
+function delUpstream(i) {
+  config.upstreams.splice(i, 1);
+  renderUpstreams();
+  renderRoutes();
+}
+
+function addRoute() {
+  if (!config.routes) config.routes = {};
+  config.routes['model-name'] = config.upstreams[0] ? config.upstreams[0].name : '';
+  renderRoutes();
+}
+
+function delRoute(i) {
+  const entries = Object.entries(config.routes);
+  delete config.routes[entries[i][0]];
+  renderRoutes();
+}
+
+function toggleKey(btn) {
+  const input = btn.previousElementSibling;
+  input.type = input.type === 'password' ? 'text' : 'password';
+  btn.textContent = input.type === 'password' ? '显示' : '隐藏';
+}
+
+async function saveConfig() {
+  config.listen.host = document.getElementById('listen-host').value;
+  config.listen.port = parseInt(document.getElementById('listen-port').value) || 8318;
+  const res = await fetch('/api/config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(config)
+  });
+  const data = await res.json();
+  if (data.error) { toast('保存失败: ' + data.error, false); return; }
+  toast('已保存到配置文件');
+  await loadConfig();
+}
+
+async function checkHealth() {
+  const results = await api('/api/health');
+  results.forEach((r, i) => {
+    const dot = document.getElementById('dot-' + i);
+    if (!dot) return;
+    dot.className = 'dot ' + (r.ok ? 'ok' : 'fail');
+    dot.title = r.detail + (r.latency ? ' (' + r.latency + ')' : '');
+  });
+  const okCount = results.filter(r => r.ok).length;
+  toast(`健康检查完成：${okCount}/${results.length} 正常`, okCount === results.length);
+}
+
+async function testUpstream(i) {
+  const up = config.upstreams[i];
+  const res = await fetch('/api/health');
+  const results = await res.json();
+  const r = results[i];
+  if (r) {
+    toast(`${up.name}: ${r.ok ? '正常' : r.detail}${r.latency ? ' (' + r.latency + ')' : ''}`, r.ok);
+  }
+}
+
+async function loadLogs() {
+  const logs = await api('/api/logs');
+  const box = document.getElementById('logs');
+  if (!logs.length) {
+    box.innerHTML = '<div class="log-empty">暂无请求</div>';
+    return;
+  }
+  box.innerHTML = `
+    <table>
+      <tr><th>时间</th><th>方法</th><th>模型</th><th>上游</th><th>转换</th><th>状态</th><th>耗时</th></tr>
+      ${logs.map(l => `
+        <tr>
+          <td class="mono">${esc(l.time)}</td>
+          <td>${esc(l.method)}</td>
+          <td class="mono">${esc(l.model || '-')}</td>
+          <td>${esc(l.upstream || '-')}</td>
+          <td>${l.convert ? '<span class="badge">'+esc(l.convert)+'</span>' : '<span class="muted">透传</span>'}</td>
+          <td><span class="status-badge ${l.status>=200&&l.status<300?'status-200':'status-err'}">${l.status}</span></td>
+          <td class="mono">${esc(l.duration)}</td>
+        </tr>
+      `).join('')}
+    </table>
+  `;
+}
+
+async function clearLogs() {
+  await fetch('/api/logs/clear', { method: 'POST' });
+  await loadLogs();
+  toast('日志已清空');
+}
+
+function esc(s) {
+  return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// 初始加载
+loadConfig();
+loadLogs();
+setInterval(loadLogs, 5000);
+</script>
+</body>
+</html>
