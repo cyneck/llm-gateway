@@ -1,4 +1,6 @@
-package main
+// Package convert 实现 OpenAI Chat Completions 与 Anthropic Messages
+// 两种协议间的请求/响应双向转换。全部为纯函数，无外部状态。
+package convert
 
 import (
 	"encoding/json"
@@ -7,11 +9,11 @@ import (
 )
 
 // ============================================================================
-// 请求转换：OpenAI Chat Completions <-> Anthropic Messages
+// 请求转换：OpenAI Chat Completions -> Anthropic Messages
 // ============================================================================
 
-// convertReqOpenAIToAnthropic 把 OpenAI 请求转成 Anthropic 请求
-func convertReqOpenAIToAnthropic(in map[string]any) map[string]any {
+// ReqOpenAIToAnthropic 把 OpenAI 请求转成 Anthropic 请求
+func ReqOpenAIToAnthropic(in map[string]any) map[string]any {
 	out := map[string]any{}
 
 	if v, ok := in["model"]; ok {
@@ -66,7 +68,7 @@ func convertReqOpenAIToAnthropic(in map[string]any) map[string]any {
 		}
 
 		// user / assistant
-		blocks := convertContentOpenAIToAnthropic(role, content, msg["tool_calls"])
+		blocks := contentOpenAIToAnthropicBlocks(role, content, msg["tool_calls"])
 		anthMessages = append(anthMessages, map[string]any{"role": role, "content": blocks})
 	}
 
@@ -95,21 +97,28 @@ func convertReqOpenAIToAnthropic(in map[string]any) map[string]any {
 		}
 	}
 
-	// 移除不支持/多余的字段
-	delete(out, "max_completion_tokens")
-
 	return out
 }
 
-// convertContentOpenAIToAnthropic 转换单个消息的 content + tool_calls
-func convertContentOpenAIToAnthropic(role string, content any, toolCallsAny any) any {
-	// 若 content 本身已是数组（部分 OpenAI 兼容后端），直接透传基础文本
+// contentOpenAIToAnthropicBlocks 转换单个消息的 content + tool_calls 为 Anthropic blocks
+func contentOpenAIToAnthropicBlocks(role string, content any, toolCallsAny any) any {
+	// content 为数组（多模态：text / image_url 混排）
 	if arr, ok := content.([]any); ok {
 		blocks := make([]any, 0, len(arr))
 		for _, b := range arr {
 			bm, _ := b.(map[string]any)
-			if bm != nil && bm["type"] == "text" {
-				blocks = append(blocks, bm)
+			if bm == nil {
+				continue
+			}
+			switch bm["type"] {
+			case "text":
+				blocks = append(blocks, map[string]any{
+					"type": "text", "text": orEmpty(bm["text"]),
+				})
+			case "image_url":
+				if ib := openAIImageToAnthropic(bm); ib != nil {
+					blocks = append(blocks, ib)
+				}
 			}
 		}
 		blocks = append(blocks, toolCallsToBlocks(toolCallsAny)...)
@@ -125,6 +134,34 @@ func convertContentOpenAIToAnthropic(role string, content any, toolCallsAny any)
 		blocks = append(blocks, map[string]any{"type": "text", "text": ""})
 	}
 	return blocks
+}
+
+// openAIImageToAnthropic 把 OpenAI image_url part 转成 Anthropic image block
+func openAIImageToAnthropic(bm map[string]any) map[string]any {
+	iu, _ := bm["image_url"].(map[string]any)
+	if iu == nil {
+		return nil
+	}
+	url := orEmpty(iu["url"])
+	if url == "" {
+		return nil
+	}
+	// data URL: data:image/png;base64,xxxx -> base64 source block
+	if mediaType, data, ok := splitDataURL(url); ok {
+		return map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": mediaType,
+				"data":       data,
+			},
+		}
+	}
+	// 远程 URL
+	return map[string]any{
+		"type":   "image",
+		"source": map[string]any{"type": "url", "url": url},
+	}
 }
 
 // toolCallsToBlocks 把 OpenAI tool_calls 转成 Anthropic tool_use blocks
@@ -151,8 +188,12 @@ func toolCallsToBlocks(toolCallsAny any) []any {
 	return blocks
 }
 
-// convertReqAnthropicToOpenAI 把 Anthropic 请求转成 OpenAI 请求
-func convertReqAnthropicToOpenAI(in map[string]any) map[string]any {
+// ============================================================================
+// 请求转换：Anthropic Messages -> OpenAI Chat Completions
+// ============================================================================
+
+// ReqAnthropicToOpenAI 把 Anthropic 请求转成 OpenAI 请求
+func ReqAnthropicToOpenAI(in map[string]any) map[string]any {
 	out := map[string]any{}
 
 	if v, ok := in["model"]; ok {
@@ -198,6 +239,7 @@ func convertReqAnthropicToOpenAI(in map[string]any) map[string]any {
 		// content 是 blocks 数组
 		blocks, _ := content.([]any)
 		var textParts []string
+		var imageParts []any
 		var toolCalls []any
 		var toolResults []map[string]any
 
@@ -208,6 +250,10 @@ func convertReqAnthropicToOpenAI(in map[string]any) map[string]any {
 			case "text":
 				if s, ok := bm["text"].(string); ok {
 					textParts = append(textParts, s)
+				}
+			case "image":
+				if part := anthropicImageToOpenAI(bm); part != nil {
+					imageParts = append(imageParts, part)
 				}
 			case "tool_use":
 				inputJSON, _ := json.Marshal(bm["input"])
@@ -235,6 +281,16 @@ func convertReqAnthropicToOpenAI(in map[string]any) map[string]any {
 				"tool_calls": toolCalls,
 			}
 			openaiMsgs = append(openaiMsgs, msgObj)
+		} else if len(imageParts) > 0 {
+			// 多模态：text + image_url 混排
+			parts := make([]any, 0, len(textParts)+len(imageParts))
+			if len(textParts) > 0 {
+				parts = append(parts, map[string]any{
+					"type": "text", "text": strings.Join(textParts, ""),
+				})
+			}
+			parts = append(parts, imageParts...)
+			openaiMsgs = append(openaiMsgs, map[string]any{"role": role, "content": parts})
 		} else if len(textParts) > 0 {
 			openaiMsgs = append(openaiMsgs, map[string]any{"role": role, "content": strings.Join(textParts, "")})
 		}
@@ -268,12 +324,38 @@ func convertReqAnthropicToOpenAI(in map[string]any) map[string]any {
 	return out
 }
 
+// anthropicImageToOpenAI 把 Anthropic image block 转成 OpenAI image_url part
+func anthropicImageToOpenAI(bm map[string]any) map[string]any {
+	src, _ := bm["source"].(map[string]any)
+	if src == nil {
+		return nil
+	}
+	switch src["type"] {
+	case "base64":
+		mediaType := orEmpty(src["media_type"])
+		if mediaType == "" {
+			mediaType = "image/png"
+		}
+		url := "data:" + mediaType + ";base64," + orEmpty(src["data"])
+		return map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": url},
+		}
+	case "url":
+		return map[string]any{
+			"type":      "image_url",
+			"image_url": map[string]any{"url": orEmpty(src["url"])},
+		}
+	}
+	return nil
+}
+
 // ============================================================================
 // 响应转换（非流式）
 // ============================================================================
 
-// convertRespOpenAIToAnthropic 把 OpenAI 响应转成 Anthropic 响应
-func convertRespOpenAIToAnthropic(in map[string]any) map[string]any {
+// RespOpenAIToAnthropic 把 OpenAI 响应转成 Anthropic 响应
+func RespOpenAIToAnthropic(in map[string]any) map[string]any {
 	out := map[string]any{
 		"id":    in["id"],
 		"type":  "message",
@@ -289,7 +371,7 @@ func convertRespOpenAIToAnthropic(in map[string]any) map[string]any {
 		choice, _ := choices[0].(map[string]any)
 		msg, _ := choice["message"].(map[string]any)
 		if fr, ok := choice["finish_reason"].(string); ok {
-			finishReason = mapOpenAIFinishToAnthropic(fr)
+			finishReason = MapOpenAIFinishToAnthropic(fr)
 		}
 
 		if c, ok := msg["content"].(string); ok && c != "" {
@@ -330,8 +412,8 @@ func convertRespOpenAIToAnthropic(in map[string]any) map[string]any {
 	return out
 }
 
-// convertRespAnthropicToOpenAI 把 Anthropic 响应转成 OpenAI 响应
-func convertRespAnthropicToOpenAI(in map[string]any) map[string]any {
+// RespAnthropicToOpenAI 把 Anthropic 响应转成 OpenAI 响应
+func RespAnthropicToOpenAI(in map[string]any) map[string]any {
 	out := map[string]any{
 		"id":     in["id"],
 		"object": "chat.completion",
@@ -339,6 +421,7 @@ func convertRespAnthropicToOpenAI(in map[string]any) map[string]any {
 	}
 
 	var textParts []string
+	var reasoning string
 	var toolCalls []any
 
 	content, _ := in["content"].([]any)
@@ -349,6 +432,10 @@ func convertRespAnthropicToOpenAI(in map[string]any) map[string]any {
 		case "text":
 			if s, ok := bm["text"].(string); ok {
 				textParts = append(textParts, s)
+			}
+		case "thinking":
+			if s, ok := bm["thinking"].(string); ok {
+				reasoning = s
 			}
 		case "tool_use":
 			inputJSON, _ := json.Marshal(bm["input"])
@@ -364,6 +451,9 @@ func convertRespAnthropicToOpenAI(in map[string]any) map[string]any {
 	}
 
 	msg := map[string]any{"role": "assistant", "content": strings.Join(textParts, "")}
+	if reasoning != "" {
+		msg["reasoning_content"] = reasoning
+	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
 	}
@@ -372,7 +462,7 @@ func convertRespAnthropicToOpenAI(in map[string]any) map[string]any {
 		map[string]any{
 			"index":         0,
 			"message":       msg,
-			"finish_reason": mapAnthropicStopToOpenAI(orString(in["stop_reason"])),
+			"finish_reason": MapAnthropicStopToOpenAI(orString(in["stop_reason"])),
 		},
 	}
 
@@ -413,6 +503,29 @@ func stringifyContent(v any) string {
 	}
 }
 
+// splitDataURL 解析 data URL：data:image/png;base64,xxxx
+// 返回 (mediaType, data, ok)
+func splitDataURL(url string) (string, string, bool) {
+	const prefix = "data:"
+	if !strings.HasPrefix(url, prefix) {
+		return "", "", false
+	}
+	rest := url[len(prefix):]
+	comma := strings.Index(rest, ",")
+	if comma < 0 {
+		return "", "", false
+	}
+	meta := rest[:comma]
+	data := rest[comma+1:]
+	mediaType := "image/png"
+	if i := strings.Index(meta, ";"); i >= 0 {
+		mediaType = meta[:i]
+	} else if meta != "" {
+		mediaType = meta
+	}
+	return mediaType, data, true
+}
+
 func orEmpty(v any) string {
 	if s, ok := v.(string); ok {
 		return s
@@ -447,7 +560,8 @@ func orString(v any) string {
 	return ""
 }
 
-func mapOpenAIFinishToAnthropic(fr string) string {
+// MapOpenAIFinishToAnthropic finish_reason 映射
+func MapOpenAIFinishToAnthropic(fr string) string {
 	switch fr {
 	case "tool_calls", "function_call":
 		return "tool_use"
@@ -460,7 +574,8 @@ func mapOpenAIFinishToAnthropic(fr string) string {
 	}
 }
 
-func mapAnthropicStopToOpenAI(sr string) string {
+// MapAnthropicStopToOpenAI stop_reason 映射
+func MapAnthropicStopToOpenAI(sr string) string {
 	switch sr {
 	case "tool_use":
 		return "tool_calls"

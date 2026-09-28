@@ -1,4 +1,4 @@
-package main
+package gateway
 
 import (
 	"encoding/json"
@@ -6,11 +6,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"llm-gateway/internal/config"
 )
 
 // 模拟 OpenAI 上游，验证网关的完整转换链路
 func TestEndToEnd_AnthropicEntryToOpenAIUpstream(t *testing.T) {
-	// mock OpenAI 上游：校验收到的请求是 OpenAI 格式，返回 OpenAI 响应
 	var receivedModel string
 	var receivedIsOpenAI bool
 	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -20,7 +21,6 @@ func TestEndToEnd_AnthropicEntryToOpenAIUpstream(t *testing.T) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		receivedModel = body["model"].(string)
-		// OpenAI 格式的特征：messages 数组里是 {role, content}
 		if msgs, ok := body["messages"].([]any); ok && len(msgs) > 0 {
 			if m, ok := msgs[0].(map[string]any); ok {
 				_, hasContent := m["content"]
@@ -44,26 +44,21 @@ func TestEndToEnd_AnthropicEntryToOpenAIUpstream(t *testing.T) {
 	}))
 	defer mockUpstream.Close()
 
-	// 配置网关：mock 作为 openai 上游
-	store := &ConfigStore{
-		path: t.TempDir() + "/config.json",
-		cfg: &Config{
-			Listen: ListenConfig{Host: "127.0.0.1", Port: 0},
-			Upstreams: []Upstream{
-				{Name: "mock", Protocol: "openai", BaseURL: mockUpstream.URL, APIKey: "sk-test", Models: []string{"deepseek-chat"}},
-			},
-			Routes: map[string]string{},
+	store := &config.Store{}
+	store.SetForTest(&config.Config{
+		Listen: config.Listen{Host: "127.0.0.1", Port: 0},
+		Upstreams: []config.Upstream{
+			{Name: "mock", Protocol: "openai", BaseURL: mockUpstream.URL, APIKey: "sk-test", Models: []string{"deepseek-chat"}},
 		},
-	}
-	g := NewGateway(store)
+		Routes: map[string]string{},
+	})
+	g := New(store)
 
-	// 通过 Anthropic 入口发请求
 	anthReq := `{"model":"deepseek-chat","max_tokens":100,"stream":false,"messages":[{"role":"user","content":"你好"}]}`
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(anthReq))
 	rec := httptest.NewRecorder()
-	g.handleAnthropic(rec, req)
+	g.HandleAnthropic(rec, req)
 
-	// 校验 mock 收到的是 OpenAI 格式
 	if receivedModel != "deepseek-chat" {
 		t.Errorf("mock 收到的模型错误: %s", receivedModel)
 	}
@@ -71,7 +66,6 @@ func TestEndToEnd_AnthropicEntryToOpenAIUpstream(t *testing.T) {
 		t.Errorf("mock 收到的不是 OpenAI 格式消息")
 	}
 
-	// 校验返回的是 Anthropic 格式
 	var resp map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("响应不是合法 JSON: %v", err)
@@ -103,21 +97,19 @@ func TestEndToEnd_OpenAIEntryToOpenAIUpstream(t *testing.T) {
 	}))
 	defer mockUpstream.Close()
 
-	store := &ConfigStore{
-		path: t.TempDir() + "/config.json",
-		cfg: &Config{
-			Listen: ListenConfig{Host: "127.0.0.1", Port: 0},
-			Upstreams: []Upstream{
-				{Name: "mock", Protocol: "openai", BaseURL: mockUpstream.URL, APIKey: "sk-test", Models: []string{"deepseek-chat"}},
-			},
-			Routes: map[string]string{},
+	store := &config.Store{}
+	store.SetForTest(&config.Config{
+		Listen: config.Listen{Host: "127.0.0.1", Port: 0},
+		Upstreams: []config.Upstream{
+			{Name: "mock", Protocol: "openai", BaseURL: mockUpstream.URL, APIKey: "sk-test", Models: []string{"deepseek-chat"}},
 		},
-	}
-	g := NewGateway(store)
+		Routes: map[string]string{},
+	})
+	g := New(store)
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
-	g.handleOpenAI(rec, req)
+	g.HandleOpenAI(rec, req)
 
 	var resp map[string]any
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)

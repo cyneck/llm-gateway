@@ -1,14 +1,16 @@
-package main
+package gateway
 
 import (
 	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
+
+	"llm-gateway/internal/config"
 )
 
-// registerAdminRoutes 注册管理 API
-func registerAdminRoutes(mux *http.ServeMux, store *ConfigStore, g *Gateway) {
+// RegisterAdminRoutes 注册管理 API
+func RegisterAdminRoutes(mux *http.ServeMux, store *config.Store, g *Gateway) {
 	// 网关信息
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
 		cfg := store.Get()
@@ -25,19 +27,10 @@ func registerAdminRoutes(mux *http.ServeMux, store *ConfigStore, g *Gateway) {
 		case http.MethodGet:
 			writeJSON(w, 200, store.Get())
 		case http.MethodPut, http.MethodPost:
-			var cfg Config
+			var cfg config.Config
 			if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
 				writeJSON(w, 400, map[string]any{"error": "invalid config JSON"})
 				return
-			}
-			if cfg.Listen.Host == "" {
-				cfg.Listen.Host = "127.0.0.1"
-			}
-			if cfg.Listen.Port == 0 {
-				cfg.Listen.Port = 8318
-			}
-			if cfg.Routes == nil {
-				cfg.Routes = map[string]string{}
 			}
 			if err := store.Save(&cfg); err != nil {
 				writeJSON(w, 500, map[string]any{"error": err.Error()})
@@ -68,13 +61,13 @@ func registerAdminRoutes(mux *http.ServeMux, store *ConfigStore, g *Gateway) {
 
 	// 请求日志
 	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, g.logs.list())
+		writeJSON(w, 200, g.logs.List())
 	})
 
 	// 清空日志
 	mux.HandleFunc("/api/logs/clear", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
-			g.logs = newLogBuffer(300)
+			g.logs = NewLogBuffer(300)
 			writeJSON(w, 200, map[string]any{"ok": true})
 			return
 		}
@@ -83,7 +76,7 @@ func registerAdminRoutes(mux *http.ServeMux, store *ConfigStore, g *Gateway) {
 }
 
 // probeUpstream 探测上游连通性与鉴权
-func probeUpstream(client *http.Client, up *Upstream) (ok bool, detail string, latency string) {
+func probeUpstream(client *http.Client, up *config.Upstream) (ok bool, detail string, latency string) {
 	start := time.Now()
 	var url string
 	if up.Protocol == "anthropic" {

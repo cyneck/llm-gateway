@@ -1,4 +1,5 @@
-package main
+// Package config 网关配置的加载、存储与模型路由解析。
+package config
 
 import (
 	"encoding/json"
@@ -8,8 +9,8 @@ import (
 	"sync"
 )
 
-// ListenConfig 网关监听地址
-type ListenConfig struct {
+// Listen 网关监听地址
+type Listen struct {
 	Host string `json:"host"`
 	Port int    `json:"port"`
 }
@@ -25,15 +26,15 @@ type Upstream struct {
 
 // Config 网关完整配置
 type Config struct {
-	Listen    ListenConfig      `json:"listen"`
+	Listen    Listen            `json:"listen"`
 	Upstreams []Upstream        `json:"upstreams"`
 	Routes    map[string]string `json:"routes"` // model 名 -> upstream name（可选，缺省时按 Models 自动匹配）
 }
 
-// DefaultConfig 生成一份可运行的默认配置
-func DefaultConfig() *Config {
+// Default 生成一份可运行的默认配置
+func Default() *Config {
 	return &Config{
-		Listen: ListenConfig{Host: "127.0.0.1", Port: 8318},
+		Listen: Listen{Host: "127.0.0.1", Port: 8318},
 		Upstreams: []Upstream{
 			{
 				Name:     "deepseek",
@@ -54,21 +55,21 @@ func DefaultConfig() *Config {
 	}
 }
 
-// ConfigStore 配置的线程安全读写封装
-type ConfigStore struct {
+// Store 配置的线程安全读写封装
+type Store struct {
 	mu   sync.RWMutex
 	path string
 	cfg  *Config
 }
 
-// LoadConfig 从磁盘加载配置；不存在则用默认配置并落盘
-func LoadConfig(path string) (*ConfigStore, error) {
-	store := &ConfigStore{path: path}
+// Load 从磁盘加载配置；不存在则用默认配置并落盘
+func Load(path string) (*Store, error) {
+	store := &Store{path: path}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			cfg := DefaultConfig()
+			cfg := Default()
 			if err := writeConfig(path, cfg); err != nil {
 				return nil, fmt.Errorf("写入默认配置失败: %w", err)
 			}
@@ -82,6 +83,13 @@ func LoadConfig(path string) (*ConfigStore, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("配置 JSON 解析失败: %w", err)
 	}
+	normalize(&cfg)
+	store.cfg = &cfg
+	return store, nil
+}
+
+// normalize 补齐缺省字段
+func normalize(cfg *Config) {
 	if cfg.Listen.Host == "" {
 		cfg.Listen.Host = "127.0.0.1"
 	}
@@ -91,12 +99,10 @@ func LoadConfig(path string) (*ConfigStore, error) {
 	if cfg.Routes == nil {
 		cfg.Routes = map[string]string{}
 	}
-	store.cfg = &cfg
-	return store, nil
 }
 
 // Get 返回配置快照（深拷贝，避免外部改动）
-func (s *ConfigStore) Get() *Config {
+func (s *Store) Get() *Config {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	cp := *s.cfg
@@ -110,9 +116,10 @@ func (s *ConfigStore) Get() *Config {
 }
 
 // Save 保存配置到内存并原子落盘
-func (s *ConfigStore) Save(cfg *Config) error {
+func (s *Store) Save(cfg *Config) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	normalize(cfg)
 	if err := writeConfig(s.path, cfg); err != nil {
 		return err
 	}
@@ -142,7 +149,7 @@ func writeConfig(path string, cfg *Config) error {
 
 // ResolveUpstream 根据模型名找到目标上游
 // 优先级：Routes 显式映射 > Upstreams 的 Models 列表 > 唯一上游兜底
-func (s *ConfigStore) ResolveUpstream(model string) *Upstream {
+func (s *Store) ResolveUpstream(model string) *Upstream {
 	cfg := s.Get()
 	if name, ok := cfg.Routes[model]; ok {
 		for i := range cfg.Upstreams {
@@ -162,4 +169,12 @@ func (s *ConfigStore) ResolveUpstream(model string) *Upstream {
 		return &cfg.Upstreams[0]
 	}
 	return nil
+}
+
+// SetForTest 直接注入内存配置（不落盘），仅供测试使用。
+func (s *Store) SetForTest(cfg *Config) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	normalize(cfg)
+	s.cfg = cfg
 }

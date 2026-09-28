@@ -1,4 +1,5 @@
-package main
+// Package gateway 实现 LLM 网关核心：请求转发、协议选择、流式/非流式处理。
+package gateway
 
 import (
 	"bufio"
@@ -6,20 +7,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"llm-gateway/internal/config"
+	"llm-gateway/internal/convert"
 )
 
 // Gateway 网关核心
 type Gateway struct {
-	store  *ConfigStore
+	store  *config.Store
 	client *http.Client
-	logs   *logBuffer
+	logs   *LogBuffer
 }
 
-func NewGateway(store *ConfigStore) *Gateway {
+// New 创建网关
+func New(store *config.Store) *Gateway {
 	return &Gateway{
 		store: store,
 		client: &http.Client{
@@ -29,22 +33,22 @@ func NewGateway(store *ConfigStore) *Gateway {
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
-		logs: newLogBuffer(300),
+		logs: NewLogBuffer(300),
 	}
 }
 
-// handleOpenAI 处理 /v1/chat/completions（OpenAI 入口）
-func (g *Gateway) handleOpenAI(w http.ResponseWriter, r *http.Request) {
+// HandleOpenAI 处理 /v1/chat/completions（OpenAI 入口）
+func (g *Gateway) HandleOpenAI(w http.ResponseWriter, r *http.Request) {
 	g.forward(w, r, "openai")
 }
 
-// handleAnthropic 处理 /v1/messages（Anthropic 入口）
-func (g *Gateway) handleAnthropic(w http.ResponseWriter, r *http.Request) {
+// HandleAnthropic 处理 /v1/messages（Anthropic 入口）
+func (g *Gateway) HandleAnthropic(w http.ResponseWriter, r *http.Request) {
 	g.forward(w, r, "anthropic")
 }
 
-// handleModels 处理 /v1/models
-func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
+// HandleModels 处理 /v1/models
+func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cfg := g.store.Get()
 	data := make([]any, 0)
 	for _, up := range cfg.Upstreams {
@@ -60,69 +64,69 @@ func (g *Gateway) handleModels(w http.ResponseWriter, r *http.Request) {
 // forward 通用转发：读请求 -> 路由 -> 转换 -> 转发 -> 处理响应
 func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol string) {
 	start := time.Now()
-	rec := &reqRecord{
-		time:     start,
-		method:   r.Method,
-		path:     r.URL.Path,
-		entry:    entryProtocol,
+	rec := &ReqRecord{
+		Time:   start,
+		Method: r.Method,
+		Path:   r.URL.Path,
+		Entry:  entryProtocol,
 	}
 	defer func() {
-		rec.duration = time.Since(start)
-		g.logs.add(rec)
+		rec.Duration = time.Since(start)
+		g.logs.Add(rec)
 	}()
 
 	// 读请求体
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		rec.status = 400
-		rec.err = "读取请求体失败"
+		rec.Status = 400
+		rec.Err = "读取请求体失败"
 		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "invalid request body", "type": "invalid_request_error"}})
 		return
 	}
 
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		rec.status = 400
-		rec.err = "JSON 解析失败"
+		rec.Status = 400
+		rec.Err = "JSON 解析失败"
 		writeJSON(w, 400, map[string]any{"error": map[string]any{"message": "invalid JSON", "type": "invalid_request_error"}})
 		return
 	}
 
 	model := orString(payload["model"])
-	rec.model = model
+	rec.Model = model
 
 	upstream := g.store.ResolveUpstream(model)
 	if upstream == nil {
-		rec.status = 404
-		rec.err = "找不到模型对应的上游"
+		rec.Status = 404
+		rec.Err = "找不到模型对应的上游"
 		writeJSON(w, 404, map[string]any{"error": map[string]any{
 			"message": fmt.Sprintf("no upstream configured for model %q", model),
 			"type":    "model_not_found",
 		}})
 		return
 	}
-	rec.upstream = upstream.Name
+	rec.Upstream = upstream.Name
 
 	// 判断是否需要协议转换
 	needsConvert := entryProtocol != upstream.Protocol
 	if needsConvert {
 		if entryProtocol == "openai" && upstream.Protocol == "anthropic" {
-			payload = convertReqOpenAIToAnthropic(payload)
-			rec.convert = "openai→anthropic"
+			payload = convert.ReqOpenAIToAnthropic(payload)
+			rec.Convert = "openai→anthropic"
 		} else if entryProtocol == "anthropic" && upstream.Protocol == "openai" {
-			payload = convertReqAnthropicToOpenAI(payload)
-			rec.convert = "anthropic→openai"
+			payload = convert.ReqAnthropicToOpenAI(payload)
+			rec.Convert = "anthropic→openai"
 		}
 	}
 
 	// 拼目标 URL
-	targetURL, targetPath := upstreamTarget(upstream, entryProtocol)
+	targetURL := upstreamTarget(upstream)
 	reqBody, _ := json.Marshal(payload)
 
 	req, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(reqBody))
 	if err != nil {
-		rec.status = 500
-		rec.err = "构造上游请求失败"
+		rec.Status = 500
+		rec.Err = "构造上游请求失败"
 		writeJSON(w, 500, map[string]any{"error": map[string]any{"message": "internal error", "type": "internal_error"}})
 		return
 	}
@@ -132,7 +136,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
 
-	rec.upstreamURL = targetURL
+	rec.UpstreamURL = targetURL
 
 	// 判断流式
 	isStream := false
@@ -142,36 +146,34 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 
 	resp, err := g.client.Do(req)
 	if err != nil {
-		rec.status = 502
-		rec.err = "上游连接失败: " + err.Error()
+		rec.Status = 502
+		rec.Err = "上游连接失败: " + err.Error()
 		writeJSON(w, 502, map[string]any{"error": map[string]any{
 			"message": "upstream unreachable: " + err.Error(), "type": "upstream_error",
 		}})
 		return
 	}
 	defer resp.Body.Close()
-	rec.status = resp.StatusCode
+	rec.Status = resp.StatusCode
 
 	// 上游报错：透传
 	if resp.StatusCode >= 400 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(resp.StatusCode)
 		_, _ = io.Copy(w, resp.Body)
-		rec.err = "上游返回 " + resp.Status
+		rec.Err = "上游返回 " + resp.Status
 		return
 	}
 
 	if isStream {
-		g.proxyStream(w, resp, entryProtocol, upstream.Protocol, needsConvert)
+		g.proxyStream(w, resp, upstream.Protocol, needsConvert)
 	} else {
-		g.proxyNonStream(w, resp, entryProtocol, upstream.Protocol, needsConvert)
+		g.proxyNonStream(w, resp, upstream.Protocol, needsConvert)
 	}
-
-	_ = targetPath
 }
 
 // proxyNonStream 非流式响应转发（含协议转换）
-func (g *Gateway) proxyNonStream(w http.ResponseWriter, resp *http.Response, entry, upstreamProto string, needsConvert bool) {
+func (g *Gateway) proxyNonStream(w http.ResponseWriter, resp *http.Response, upstreamProto string, needsConvert bool) {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "read upstream failed", "type": "upstream_error"}})
@@ -195,15 +197,21 @@ func (g *Gateway) proxyNonStream(w http.ResponseWriter, resp *http.Response, ent
 	// 响应转换：按"上游返回的协议"决定用哪个转换函数
 	var out map[string]any
 	if upstreamProto == "anthropic" {
-		out = convertRespAnthropicToOpenAI(respJSON) // 上游 Anthropic -> 客户端 OpenAI
+		out = convert.RespAnthropicToOpenAI(respJSON) // 上游 Anthropic -> 客户端 OpenAI
 	} else {
-		out = convertRespOpenAIToAnthropic(respJSON) // 上游 OpenAI -> 客户端 Anthropic
+		out = convert.RespOpenAIToAnthropic(respJSON) // 上游 OpenAI -> 客户端 Anthropic
 	}
 	writeJSON(w, resp.StatusCode, out)
 }
 
+// streamConverter 流式转换器统一接口
+type streamConverter interface {
+	Convert(data string) []convert.SSEEvent
+	Finish() []convert.SSEEvent
+}
+
 // proxyStream 流式响应转发（含协议转换）
-func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, entry, upstreamProto string, needsConvert bool) {
+func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, upstreamProto string, needsConvert bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -228,42 +236,33 @@ func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, entry,
 	// 协议转换流：转换器按"上游协议"选择
 	var converter streamConverter
 	if upstreamProto == "anthropic" {
-		converter = newAOStreamConverter() // 上游 Anthropic 事件 -> OpenAI chunk
+		converter = convert.NewAOStreamConverter() // 上游 Anthropic 事件 -> OpenAI chunk
 	} else {
-		converter = newOAStreamConverter() // 上游 OpenAI chunk -> Anthropic 事件
+		converter = convert.NewOAStreamConverter() // 上游 OpenAI chunk -> Anthropic 事件
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	var currentEvent string
 	for scanner.Scan() {
 		line := scanner.Text()
 		switch {
 		case strings.HasPrefix(line, "event:"):
-			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			// Anthropic 事件名冗余（data 内含 type），转换器直接解析 data
+			continue
 		case strings.HasPrefix(line, "data:"):
 			data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if data == "" {
 				continue
 			}
-			if upstreamProto == "anthropic" {
-				// Anthropic 上游，事件名在 currentEvent
-				events := converter.convertEvent(currentEvent, data)
-				for _, ev := range events {
-					writeSSE(w, flusher, ev)
-				}
-			} else {
-				// OpenAI 上游，直接用 data 调用
-				events := converter.convert(data)
-				for _, ev := range events {
-					writeSSE(w, flusher, ev)
-				}
+			events := converter.Convert(data)
+			for _, ev := range events {
+				writeSSE(w, flusher, ev)
 			}
 		}
 	}
 	// 补发收尾
-	for _, ev := range converter.finish() {
+	for _, ev := range converter.Finish() {
 		writeSSE(w, flusher, ev)
 	}
 	if flusher != nil {
@@ -271,44 +270,26 @@ func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, entry,
 	}
 }
 
-// streamConverter 流式转换器统一接口
-type streamConverter interface {
-	convert(data string) []sseEvent
-	convertEvent(event, data string) []sseEvent
-	finish() []sseEvent
-}
-
-// 为两个转换器补充 convertEvent 方法（Anthropic 上游时，事件名实际不影响转换，data 里含 type）
-
-func (c *oaStreamConverter) convertEvent(event, data string) []sseEvent {
-	// OpenAI->Anthropic 不会接收 Anthropic 事件，这里不会走到
-	return c.convert(data)
-}
-
-func (c *aoStreamConverter) convertEvent(event, data string) []sseEvent {
-	return c.convert(data)
-}
-
-func writeSSE(w http.ResponseWriter, flusher http.Flusher, ev sseEvent) {
+func writeSSE(w io.Writer, flusher http.Flusher, ev convert.SSEEvent) {
 	var sb strings.Builder
-	if ev.event != "" {
-		sb.WriteString("event: " + ev.event + "\n")
+	if ev.Event != "" {
+		sb.WriteString("event: " + ev.Event + "\n")
 	}
-	sb.WriteString("data: " + ev.data + "\n\n")
+	sb.WriteString("data: " + ev.Data + "\n\n")
 	_, _ = io.WriteString(w, sb.String())
 	if flusher != nil {
 		flusher.Flush()
 	}
 }
 
-// upstreamTarget 计算目标 URL 和路径
-func upstreamTarget(up *Upstream, entryProtocol string) (string, string) {
+// upstreamTarget 计算目标 URL
+func upstreamTarget(up *config.Upstream) string {
 	base := strings.TrimRight(up.BaseURL, "/")
 	switch up.Protocol {
 	case "anthropic":
-		return base + "/v1/messages", "/v1/messages"
+		return base + "/v1/messages"
 	default: // openai
-		return base + "/chat/completions", "/chat/completions"
+		return base + "/chat/completions"
 	}
 }
 
@@ -318,77 +299,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// ============================================================================
-// 请求日志
-// ============================================================================
-
-type reqRecord struct {
-	time        time.Time
-	method      string
-	path        string
-	entry       string
-	model       string
-	upstream    string
-	upstreamURL string
-	convert     string
-	status      int
-	duration    time.Duration
-	err         string
-	stream      bool
-}
-
-func (r *reqRecord) toMap() map[string]any {
-	m := map[string]any{
-		"time":     r.time.Format("15:04:05"),
-		"method":   r.method,
-		"path":     r.path,
-		"model":    r.model,
-		"upstream": r.upstream,
-		"convert":  r.convert,
-		"status":   r.status,
-		"duration": r.duration.Round(time.Millisecond).String(),
+func orString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
 	}
-	if r.err != "" {
-		m["error"] = r.err
-	}
-	return m
+	return ""
 }
-
-// logBuffer 环形缓冲
-type logBuffer struct {
-	mu   chan struct{}
-	buf  []map[string]any
-	head int
-	size int
-}
-
-func newLogBuffer(size int) *logBuffer {
-	return &logBuffer{
-		mu:   make(chan struct{}, 1),
-		buf:  make([]map[string]any, 0, size),
-		size: size,
-	}
-}
-
-func (l *logBuffer) add(r *reqRecord) {
-	l.mu <- struct{}{}
-	defer func() { <-l.mu }()
-	if len(l.buf) < l.size {
-		l.buf = append(l.buf, r.toMap())
-	} else {
-		l.buf = append(l.buf, r.toMap())
-		l.buf = l.buf[1:]
-	}
-}
-
-func (l *logBuffer) list() []map[string]any {
-	l.mu <- struct{}{}
-	defer func() { <-l.mu }()
-	out := make([]map[string]any, len(l.buf))
-	for i, v := range l.buf {
-		out[len(l.buf)-1-i] = v // 最新的在前
-	}
-	return out
-}
-
-var _ = log.Println
