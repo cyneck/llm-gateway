@@ -239,6 +239,8 @@ type aoStreamConverter struct {
 	started      bool
 	finished     bool
 	stopReason   string
+	model        string         // 从 message_start 提取，透传到输出 chunk
+	usage        map[string]any // 从 message_delta 提取，附到收尾 chunk（OpenAI 格式）
 	textOpen     bool
 	anthToOATool map[int]int // anthropic block index -> openai tool index
 	nextIndex    int
@@ -263,6 +265,9 @@ func (c *aoStreamConverter) Convert(data string) []SSEEvent {
 	case "message_start":
 		if !c.started {
 			c.started = true
+			if m, ok := ev["message"].(map[string]any); ok {
+				c.model = orString(m["model"])
+			}
 			out = append(out, c.chunk(map[string]any{"role": "assistant", "content": ""}, ""))
 		}
 
@@ -321,6 +326,15 @@ func (c *aoStreamConverter) Convert(data string) []SSEEvent {
 		if d, ok := ev["delta"].(map[string]any); ok {
 			c.stopReason = orString(d["stop_reason"])
 		}
+		// Anthropic 的 usage 在 message_delta 顶层，转成 OpenAI 格式透传
+		if u, ok := ev["usage"].(map[string]any); ok {
+			pt, ct := orInt(u["input_tokens"]), orInt(u["output_tokens"])
+			c.usage = map[string]any{
+				"prompt_tokens":     pt,
+				"completion_tokens": ct,
+				"total_tokens":      pt + ct,
+			}
+		}
 
 	case "message_stop":
 		fr := MapAnthropicStopToOpenAI(c.stopReason)
@@ -338,7 +352,7 @@ func (c *aoStreamConverter) chunk(delta map[string]any, finishReason string) SSE
 		"id":      "chatcmpl-" + newID(),
 		"object":  "chat.completion.chunk",
 		"created": 0,
-		"model":   "",
+		"model":   c.model,
 		"choices": []any{
 			map[string]any{"index": 0, "delta": delta, "finish_reason": nil},
 		},
@@ -347,6 +361,9 @@ func (c *aoStreamConverter) chunk(delta map[string]any, finishReason string) SSE
 		obj["choices"] = []any{
 			map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason},
 		}
+	}
+	if c.usage != nil {
+		obj["usage"] = c.usage
 	}
 	return SSEEvent{Data: mustJSON(obj)}
 }

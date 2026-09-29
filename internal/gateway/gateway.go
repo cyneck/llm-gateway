@@ -47,6 +47,11 @@ func (g *Gateway) HandleAnthropic(w http.ResponseWriter, r *http.Request) {
 	g.forward(w, r, "anthropic")
 }
 
+// HandleResponses 处理 /v1/responses（OpenAI Responses 入口，Codex wire_api=responses）
+func (g *Gateway) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	g.forward(w, r, "responses")
+}
+
 // HandleModels 处理 /v1/models
 func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cfg := g.store.Get()
@@ -107,16 +112,24 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 	}
 	rec.Upstream = upstream.Name
 
-	// 判断是否需要协议转换
-	needsConvert := entryProtocol != upstream.Protocol
-	if needsConvert {
-		if entryProtocol == "openai" && upstream.Protocol == "anthropic" {
+	// 判断是否需要协议转换（responses 入口无论上游协议都要转换响应，恒为 true）
+	needsConvert := entryProtocol != upstream.Protocol || entryProtocol == "responses"
+	switch {
+	case entryProtocol == "responses":
+		// Responses -> Chat Completions，复用现有链路
+		payload = convert.ReqResponsesToOpenAI(payload)
+		if upstream.Protocol == "anthropic" {
 			payload = convert.ReqOpenAIToAnthropic(payload)
-			rec.Convert = "openai→anthropic"
-		} else if entryProtocol == "anthropic" && upstream.Protocol == "openai" {
-			payload = convert.ReqAnthropicToOpenAI(payload)
-			rec.Convert = "anthropic→openai"
+			rec.Convert = "responses→anthropic"
+		} else {
+			rec.Convert = "responses→openai"
 		}
+	case entryProtocol == "openai" && upstream.Protocol == "anthropic":
+		payload = convert.ReqOpenAIToAnthropic(payload)
+		rec.Convert = "openai→anthropic"
+	case entryProtocol == "anthropic" && upstream.Protocol == "openai":
+		payload = convert.ReqAnthropicToOpenAI(payload)
+		rec.Convert = "anthropic→openai"
 	}
 
 	// 拼目标 URL
@@ -166,14 +179,14 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 	}
 
 	if isStream {
-		g.proxyStream(w, resp, upstream.Protocol, needsConvert)
+		g.proxyStream(w, resp, entryProtocol, upstream.Protocol, needsConvert)
 	} else {
-		g.proxyNonStream(w, resp, upstream.Protocol, needsConvert)
+		g.proxyNonStream(w, resp, entryProtocol, upstream.Protocol, needsConvert)
 	}
 }
 
 // proxyNonStream 非流式响应转发（含协议转换）
-func (g *Gateway) proxyNonStream(w http.ResponseWriter, resp *http.Response, upstreamProto string, needsConvert bool) {
+func (g *Gateway) proxyNonStream(w http.ResponseWriter, resp *http.Response, entryProto, upstreamProto string, needsConvert bool) {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		writeJSON(w, 502, map[string]any{"error": map[string]any{"message": "read upstream failed", "type": "upstream_error"}})
@@ -194,11 +207,16 @@ func (g *Gateway) proxyNonStream(w http.ResponseWriter, resp *http.Response, ups
 		return
 	}
 
-	// 响应转换：按"上游返回的协议"决定用哪个转换函数
+	// 响应转换：按"入口协议 + 上游协议"决定转换函数链
 	var out map[string]any
-	if upstreamProto == "anthropic" {
+	switch {
+	case entryProto == "responses" && upstreamProto == "anthropic":
+		out = convert.RespOpenAIToResponses(convert.RespAnthropicToOpenAI(respJSON)) // Anthropic -> Chat -> Responses
+	case entryProto == "responses":
+		out = convert.RespOpenAIToResponses(respJSON) // Chat -> Responses
+	case upstreamProto == "anthropic":
 		out = convert.RespAnthropicToOpenAI(respJSON) // 上游 Anthropic -> 客户端 OpenAI
-	} else {
+	default:
 		out = convert.RespOpenAIToAnthropic(respJSON) // 上游 OpenAI -> 客户端 Anthropic
 	}
 	writeJSON(w, resp.StatusCode, out)
@@ -211,7 +229,7 @@ type streamConverter interface {
 }
 
 // proxyStream 流式响应转发（含协议转换）
-func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, upstreamProto string, needsConvert bool) {
+func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, entryProto, upstreamProto string, needsConvert bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -233,12 +251,35 @@ func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, upstre
 		return
 	}
 
-	// 协议转换流：转换器按"上游协议"选择
-	var converter streamConverter
-	if upstreamProto == "anthropic" {
-		converter = convert.NewAOStreamConverter() // 上游 Anthropic 事件 -> OpenAI chunk
-	} else {
-		converter = convert.NewOAStreamConverter() // 上游 OpenAI chunk -> Anthropic 事件
+	// 两级转换链：
+	// stage1（可选）：上游协议 -> OpenAI chat chunk
+	// stage2：OpenAI chat chunk -> 入口协议
+	var stage1, stage2 streamConverter
+	switch {
+	case entryProto == "responses" && upstreamProto == "anthropic":
+		stage1 = convert.NewAOStreamConverter()      // Anthropic 事件 -> chat chunk
+		stage2 = convert.NewChatToResponsesStream()  // chat chunk -> Responses 事件
+	case entryProto == "responses":
+		stage2 = convert.NewChatToResponsesStream()  // chat chunk -> Responses 事件
+	case upstreamProto == "anthropic":
+		stage2 = convert.NewAOStreamConverter()      // 上游 Anthropic 事件 -> OpenAI chunk
+	default:
+		stage2 = convert.NewOAStreamConverter()      // 上游 OpenAI chunk -> Anthropic 事件
+	}
+
+	// emit 把 stage1 的产物喂给 stage2（无 stage1 时直接处理上游 data）
+	emit := func(data string) {
+		var events []convert.SSEEvent
+		if stage1 != nil {
+			for _, ce := range stage1.Convert(data) {
+				events = append(events, stage2.Convert(ce.Data)...)
+			}
+		} else {
+			events = stage2.Convert(data)
+		}
+		for _, ev := range events {
+			writeSSE(w, flusher, ev)
+		}
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -255,14 +296,18 @@ func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, upstre
 			if data == "" {
 				continue
 			}
-			events := converter.Convert(data)
-			for _, ev := range events {
+			emit(data)
+		}
+	}
+	// 补发收尾：先冲刷 stage1 的残留，再冲刷 stage2
+	if stage1 != nil {
+		for _, ce := range stage1.Finish() {
+			for _, ev := range stage2.Convert(ce.Data) {
 				writeSSE(w, flusher, ev)
 			}
 		}
 	}
-	// 补发收尾
-	for _, ev := range converter.Finish() {
+	for _, ev := range stage2.Finish() {
 		writeSSE(w, flusher, ev)
 	}
 	if flusher != nil {
