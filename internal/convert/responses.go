@@ -13,6 +13,40 @@ import (
 // 请求转换：OpenAI Responses -> OpenAI Chat Completions
 // ============================================================================
 
+// messageFromItem 把 Responses 的 input 数组项转成一条 Chat Completions 消息。
+// 同时支持两种写法：
+//   - 标准：{"type":"message","role":"user","content":[{"type":"input_text","text":"..."}]}
+//   - 简写：{"role":"user","content":"..."}（省略 type、content 直接是字符串）
+//
+// content 取不到内容时返回空字符串的正常消息结构，由调用方决定是否丢弃。
+func messageFromItem(im map[string]any) map[string]any {
+	role, _ := im["role"].(string)
+	if role == "" {
+		role = "user"
+	}
+	var text string
+	switch c := im["content"].(type) {
+	case string:
+		text = c
+	case []any:
+		// 多 part 拼接为一条字符串 content 消息
+		var parts []string
+		for _, p := range c {
+			switch pc := p.(type) {
+			case string:
+				parts = append(parts, pc)
+			case map[string]any:
+				switch pc["type"] {
+				case "input_text", "output_text", "text":
+					parts = append(parts, orEmpty(pc["text"]))
+				}
+			}
+		}
+		text = strings.Join(parts, "")
+	}
+	return map[string]any{"role": role, "content": text}
+}
+
 // ReqResponsesToOpenAI 把 Responses 请求转成 Chat Completions 请求
 func ReqResponsesToOpenAI(in map[string]any) map[string]any {
 	out := map[string]any{}
@@ -59,23 +93,7 @@ func ReqResponsesToOpenAI(in map[string]any) map[string]any {
 			case "message":
 				// {"type":"message","role":"...","content":[{"type":"input_text"|"output_text"|"text","text":...}]}
 				// 多 part 拼接为一条字符串 content 消息
-				role, _ := im["role"].(string)
-				if role == "" {
-					role = "user"
-				}
-				var parts []string
-				content, _ := im["content"].([]any)
-				for _, c := range content {
-					cm, _ := c.(map[string]any)
-					if cm == nil {
-						continue
-					}
-					switch cm["type"] {
-					case "input_text", "output_text", "text":
-						parts = append(parts, orEmpty(cm["text"]))
-					}
-				}
-				msgs = append(msgs, map[string]any{"role": role, "content": strings.Join(parts, "")})
+				msgs = append(msgs, messageFromItem(im))
 
 			case "function_call":
 				// Responses 平铺的函数调用 -> assistant 消息 + tool_calls
@@ -110,8 +128,18 @@ func ReqResponsesToOpenAI(in map[string]any) map[string]any {
 					"tool_call_id": orEmpty(im["call_id"]),
 					"content":      outStr,
 				})
+
+			default:
+				// 省略 type 的简写写法：{"role":"user","content":"..."}。
+				// 真实客户端（含手写 curl、部分 SDK）经常不带 type，若按"未知 type"整条丢弃，
+				// 会把 messages 清空，上游就会报"缺少 messages"。只要能读出内容就当普通消息处理。
+				if _, hasType := im["type"]; !hasType {
+					if m := messageFromItem(im); orEmpty(m["content"]) != "" {
+						msgs = append(msgs, m)
+					}
+				}
+				// 其余未知 type 跳过
 			}
-			// 未知 type 跳过
 		}
 	}
 
