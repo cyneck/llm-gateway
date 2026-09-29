@@ -225,9 +225,9 @@ func TestRespOpenAIToAnthropic_Reasoning(t *testing.T) {
 		"choices": []any{
 			map[string]any{
 				"message": map[string]any{
-					"role":             "assistant",
+					"role":              "assistant",
 					"reasoning_content": "让我想想",
-					"content":          "答案是42",
+					"content":           "答案是42",
 				},
 				"finish_reason": "stop",
 			},
@@ -270,9 +270,9 @@ func TestRespAnthropicToOpenAI_Reasoning(t *testing.T) {
 
 func TestFinishReasonMapping(t *testing.T) {
 	cases := map[string]string{
-		"tool_calls":    "tool_use",
-		"length":        "max_tokens",
-		"stop":          "end_turn",
+		"tool_calls":     "tool_use",
+		"length":         "max_tokens",
+		"stop":           "end_turn",
 		"content_filter": "refusal",
 	}
 	for oa, anth := range cases {

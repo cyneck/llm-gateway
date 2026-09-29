@@ -8,10 +8,10 @@ import (
 
 func TestReqResponsesToOpenAI_StringInput(t *testing.T) {
 	in := map[string]any{
-		"model":           "deepseek-chat",
-		"instructions":    "你是助手",
+		"model":             "deepseek-chat",
+		"instructions":      "你是助手",
 		"max_output_tokens": 100,
-		"input":           "你好",
+		"input":             "你好",
 	}
 	out := ReqResponsesToOpenAI(in)
 

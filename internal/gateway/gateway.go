@@ -257,14 +257,14 @@ func (g *Gateway) proxyStream(w http.ResponseWriter, resp *http.Response, entryP
 	var stage1, stage2 streamConverter
 	switch {
 	case entryProto == "responses" && upstreamProto == "anthropic":
-		stage1 = convert.NewAOStreamConverter()      // Anthropic 事件 -> chat chunk
-		stage2 = convert.NewChatToResponsesStream()  // chat chunk -> Responses 事件
+		stage1 = convert.NewAOStreamConverter()     // Anthropic 事件 -> chat chunk
+		stage2 = convert.NewChatToResponsesStream() // chat chunk -> Responses 事件
 	case entryProto == "responses":
-		stage2 = convert.NewChatToResponsesStream()  // chat chunk -> Responses 事件
+		stage2 = convert.NewChatToResponsesStream() // chat chunk -> Responses 事件
 	case upstreamProto == "anthropic":
-		stage2 = convert.NewAOStreamConverter()      // 上游 Anthropic 事件 -> OpenAI chunk
+		stage2 = convert.NewAOStreamConverter() // 上游 Anthropic 事件 -> OpenAI chunk
 	default:
-		stage2 = convert.NewOAStreamConverter()      // 上游 OpenAI chunk -> Anthropic 事件
+		stage2 = convert.NewOAStreamConverter() // 上游 OpenAI chunk -> Anthropic 事件
 	}
 
 	// emit 把 stage1 的产物喂给 stage2（无 stage1 时直接处理上游 data）

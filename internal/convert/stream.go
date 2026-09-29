@@ -18,7 +18,7 @@ type SSEEvent struct {
 // ============================================================================
 
 type oaStreamConverter struct {
-	started      bool
+	started     bool
 	finished    bool
 	hasThinking bool // 是否已开启 thinking block
 	thinkingBlk int  // thinking 块的 Anthropic index

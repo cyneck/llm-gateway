@@ -248,11 +248,11 @@ type respToolItem struct {
 // 事件顺序严格对齐 Codex 依赖：response.created -> output_item.added ->
 // content_part.added -> output_text.delta* -> (.done 系列) -> response.completed
 type chatToResponsesStream struct {
-	started bool
+	started  bool
 	finished bool
-	respID  string
-	model   string
-	usage   map[string]any
+	respID   string
+	model    string
+	usage    map[string]any
 
 	msgItem *respMsgItem
 	textBuf strings.Builder
