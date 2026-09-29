@@ -250,6 +250,8 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 
 		targetURL := upstreamTarget(&upstream)
 		reqBody, _ := json.Marshal(conv.payload)
+		// 先记下目标地址：连不上时也要能在日志里看到"究竟打的是哪个地址"
+		rec.UpstreamURL = targetURL
 
 		maxRetries := upstream.MaxRetries
 		if maxRetries < 0 {
@@ -259,12 +261,12 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 			resp, err := g.doUpstream(r.Context(), upstream, targetURL, reqBody, srcHeaders)
 			if err == nil && resp != nil {
 				rec.Status = resp.StatusCode
-				rec.UpstreamURL = targetURL
 
 				isStream := false
 				if s, ok := conv.payload["stream"].(bool); ok {
 					isStream = s
 				}
+				rec.Stream = isStream
 
 				// 成功响应：直接处理并返回
 				if resp.StatusCode < 400 {
@@ -287,20 +289,30 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(resp.StatusCode)
 					rec.Err = "上游返回 " + resp.Status
-					if upstream.Protocol == config.ProtocolOfficial && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
-						// 官方通道被拒：网关只做透传、不注入凭证，问题一定在客户端登录态或账号套餐上，
-						// 这里把排查方向直接写进返回体和日志，避免只看到一个干巴巴的 Unauthorized。
-						body, _ := io.ReadAll(resp.Body)
+					// 鉴权类失败最容易让人对着一个状态码干猜，这里把排查方向一并写进日志和返回体
+					isAuthFail := resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden
+					body, _ := io.ReadAll(resp.Body)
+					// 非 200 的响应体是判断问题最直接的依据，原样记进日志
+					rec.Response = truncateBody(body)
+					if upstream.Protocol == config.ProtocolOfficial && isAuthFail {
+						// 官方通道被拒：网关只做透传、不注入凭证，问题在客户端登录态或出口地区上
 						_, _ = w.Write(augmentOfficialAuthError(body))
-						rec.Err += "（官方通道：凭证由客户端自带，网关未注入，请检查账号套餐/登录态）"
+						rec.Err += "（官方通道：凭证由客户端自带，网关未注入）"
+						rec.Hint = officialAuthHint
 					} else {
-						_, _ = io.Copy(w, resp.Body)
+						if isAuthFail {
+							rec.Hint = thirdPartyAuthHint
+						}
+						_, _ = w.Write(body)
 					}
 					_ = resp.Body.Close()
 					return
 				}
 
-				// 可重试错误：读 body 消耗掉，准备下一轮
+				// 可重试错误：5xx / 429 的响应体同样要留下，否则重试完只看到一个状态码
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, maxLoggedBody))
+				rec.Response = truncateBody(body)
+				// 剩余内容消耗掉，准备下一轮
 				_, _ = io.Copy(io.Discard, resp.Body)
 				_ = resp.Body.Close()
 
@@ -323,9 +335,10 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 				continue
 			}
 
-			// 网络错误
+			// 网络错误：连不上多半是出站代理或网络的问题，日志里给出排查方向
 			if attempt == maxRetries {
 				lastErr += fmt.Sprintf("; %s unreachable: %s", upstream.Name, err.Error())
+				rec.Hint = networkHint
 				break
 			}
 			time.Sleep(retryBaseDelay * time.Duration(1<<attempt))
@@ -344,6 +357,8 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 	} else {
 		rec.Err = "上游全部失败"
 	}
+	// 没有可用上游时，响应体是网关自己生成的，也一并记下来，界面上看得到完整链路
+	rec.Response = truncateBody([]byte(rec.Err))
 	writeJSON(w, 502, map[string]any{"error": map[string]any{
 		"message": rec.Err, "type": "upstream_error",
 	}})
@@ -440,9 +455,39 @@ func (g *Gateway) doUpstream(ctx context.Context, up config.Upstream, targetURL 
 
 // officialAuthHint 是官方通道返回 401/403 时附加的排查说明。
 // 网关对官方通道只做透传、不注入任何凭证，所以被拒与网关配置无关。
-const officialAuthHint = "llm-gateway 对官方通道只透传客户端自带的凭证，未做任何改写。" +
-	"被拒通常意味着：1) ChatGPT 账号套餐不含 Codex 权限（免费账号无权调用推理接口，只能查模型列表）；" +
-	"2) 登录态过期，需重新 codex login；3) 上游风控。可先用 /api/official-models/refresh 验证登录态是否仍然有效。"
+//
+// 注意：免费套餐是可以用 Codex 的（OpenAI 帮助文档写明 Codex 包含在 Free 在内的各档套餐里，
+// 只是可用的模型和用量不同），所以不要在这里提示"免费账号无权调用"——那是错误结论。
+const officialAuthHint = "llm-gateway 对官方通道只透传客户端自带的凭证，未做任何改写，被拒与网关配置无关。" +
+	"按可能性排查：1) 登录态失效（最常见）——官方返回 token_expired，重新执行 codex login；" +
+	"2) 出口 IP 所在地区不受支持——官方返回 unsupported_country_region_territory，换代理出口；" +
+	"3) 用量超限或上游风控。免费套餐可以用 Codex，但部分模型（如 Sol 系列）需要付费套餐。" +
+	"确切错误码可查 ~/.codex/logs_2.sqlite 里 codex_login::auth::manager 的 ERROR 日志。"
+
+// thirdPartyAuthHint 是第三方上游返回 401/403 时的排查提示。
+// 与官方通道相反，第三方上游由网关注入该上游自己的 Key，所以问题只可能在 Key 本身。
+const thirdPartyAuthHint = "第三方上游返回 401/403：网关注入的是该上游自己配置的 api_key，" +
+	"与客户端无关。请检查这个 Key 是否有效、是否欠费或被禁用，以及该上游是否还要求额外的鉴权头。"
+
+// maxLoggedBody 单条响应体在日志里最多保留的字节数。
+// 错误响应通常很小，但上游也可能返回整页 HTML，不截断会把 300 条的日志缓冲撑爆。
+const maxLoggedBody = 2000
+
+// truncateBody 截断响应体用于日志展示，超长时标注原始长度，避免"看起来被吞了"。
+func truncateBody(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if len(b) <= maxLoggedBody {
+		return string(b)
+	}
+	return string(b[:maxLoggedBody]) + fmt.Sprintf("\n…（已截断，完整响应 %d 字节）", len(b))
+}
+
+// networkHint 是连不上上游时的排查提示（与鉴权无关，是网络/代理层面的问题）。
+const networkHint = "请求根本没到上游（连接失败/超时），所以这既不是模型问题也不是凭证问题。" +
+	"按可能性排查：1) 出站代理没开或地址写错——检查配置里的 proxy.url 是否可达；" +
+	"2) 上游域名被网络环境拦截；3) 上游超时——可调大该上游的 timeout_seconds。"
 
 // augmentOfficialAuthError 把官方通道的鉴权失败响应补上排查提示。
 // 能解析成 JSON 就加一个 hint 字段；解析不了就原样返回，绝不丢原始错误信息。

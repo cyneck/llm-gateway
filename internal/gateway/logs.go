@@ -18,21 +18,35 @@ type ReqRecord struct {
 	Duration    time.Duration
 	Err         string
 	Stream      bool
+	// Response 非 200 时上游返回的响应体（截断后），判断问题最直接的依据
+	Response string
+	// Hint 诊断提示：出问题时直接告诉用户往哪儿查，避免对着一个状态码干猜
+	Hint string
 }
 
 func (r *ReqRecord) toMap() map[string]any {
 	m := map[string]any{
-		"time":     r.Time.Format("15:04:05"),
-		"method":   r.Method,
-		"path":     r.Path,
-		"model":    r.Model,
-		"upstream": r.Upstream,
-		"convert":  r.Convert,
-		"status":   r.Status,
-		"duration": r.Duration.Round(time.Millisecond).String(),
+		"time":         r.Time.Format("15:04:05"),
+		"method":       r.Method,
+		"path":         r.Path,
+		"entry":        r.Entry,
+		"model":        r.Model,
+		"upstream":     r.Upstream,
+		"upstream_url": r.UpstreamURL,
+		"convert":      r.Convert,
+		"status":       r.Status,
+		"duration":     r.Duration.Round(time.Millisecond).String(),
+		"duration_ms":  r.Duration.Milliseconds(),
+		"stream":       r.Stream,
 	}
 	if r.Err != "" {
 		m["error"] = r.Err
+	}
+	if r.Response != "" {
+		m["response"] = r.Response
+	}
+	if r.Hint != "" {
+		m["hint"] = r.Hint
 	}
 	return m
 }
