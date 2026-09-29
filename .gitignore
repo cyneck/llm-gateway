@@ -4,6 +4,15 @@
 
 # 运行时生成的配置（含 API Key，不入库）
 config.json
+config.local.json
+*.config.json.bak
+
+# 凭证文件（绝不入库）
+auth.json
+.env
+.env.*
+*.key
+*.pem
 
 # 测试临时文件
 test-run.log

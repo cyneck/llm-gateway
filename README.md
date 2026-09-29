@@ -364,8 +364,11 @@ Claude Code 发 `/v1/messages`，网关转成 OpenAI 格式转发到配置的上
 
 - 官方端点要靠 `ChatGPT-Account-Id`、`originator`、`session_id` 等头一起识别请求，
   只留一个 `Authorization` 会被判未授权（实测 401）
-- `auth.json` 里的 access_token 实测只能用于"列模型"（`/models` 返回 200），
-  用于"发请求"（`/responses`）一律 401 —— 拿它注入只会产生误导性的失败
+- 即便把 `auth.json` 的 token 全部带上也照样 401 —— 因为根因是**登录态本身已失效**
+  （官方返回 `token_expired`），不是网关少带了某个头。拿本地 token 注入只会掩盖真实原因
+
+> 判别小技巧：`/models` 不带 `Authorization` 也返回 401，所以"带 token 时 `/models` 返回 200"
+> 只能证明这个 token 当时还被服务端认可；若 `/responses` 同时返回 401，基本就是登录态/地区问题。
 
 第三方上游则相反：只注入该上游自己的 API Key，绝不把客户端凭证带出去。
 
@@ -387,15 +390,27 @@ Claude Code 发 `/v1/messages`，网关转成 OpenAI 格式转发到配置的上
 追加一个 `hint` 字段、并在请求日志里标注原因，直接看返回体或管理界面即可。
 按可能性从高到低排查：
 
-| 现象 | 原因 | 处理 |
+| 现象 / 官方错误码 | 原因 | 处理 |
 | --- | --- | --- |
-| `/models` 200，但 `/responses` 401 | 账号套餐不含 Codex 权限（免费账号只能列模型，不能发请求） | 换有订阅的账号重新 `codex login`，或改用第三方上游 |
-| 两个接口都 401 | 登录态过期 | 重新 `codex login` |
-| 时好时坏 | 上游风控 | 稍后重试；确认出站代理出口稳定 |
+| `token_expired`（最常见） | 登录态失效，刷新令牌也过期 | 重新执行 `codex login` |
+| `unsupported_country_region_territory` | 当前出口 IP 所在地区不受支持 | 换代理出口节点（这也是"切到 ChatGPT 还是不能用"的常见原因） |
+| 无错误码、时好时坏 | 用量超限或上游风控 | 稍后重试；确认出站代理出口稳定 |
 
-快速确认自己的套餐：解码 `~/.codex/auth.json` 里 `tokens.access_token` 的 JWT，
-看 `https://api.openai.com/auth.chatgpt_plan_type` 字段 —— 值为 `free` 就是免费账号，
-无权调用官方推理接口。
+**确切的错误码去 Codex 自己的日志里查**，比猜快得多：
+
+```bash
+# ~/.codex/logs_2.sqlite 的 logs 表，看 codex_login::auth::manager 的 ERROR
+sqlite3 ~/.codex/logs_2.sqlite \
+  "SELECT datetime(ts,'unixepoch'), feedback_log_body FROM logs
+   WHERE target LIKE '%auth::manager%' AND level='ERROR' ORDER BY id DESC LIMIT 5;"
+```
+
+实测样本（2026-09-29）：日志里明确写着
+`Failed to refresh token status=401 Unauthorized ... error_code: "token_expired"`。
+
+> **免费套餐是可以用 Codex 的。** OpenAI 帮助文档写明 Codex 包含在 Free 在内的各档
+> ChatGPT 套餐中，只是可用模型和用量不同（例如 Sol 系列需付费套餐）。
+> 所以遇到 401 不要往"套餐不够"上想，先查是不是登录态过期。
 
 ## 统一出站代理
 
