@@ -80,6 +80,26 @@ export ANTHROPIC_API_KEY="任意占位"
 
 Claude Code 发 `/v1/messages`，网关转成 OpenAI 格式转发到配置的上游（如 DeepSeek）。
 
+### Docker 部署
+
+Go 单二进制天然适合容器化，多阶段构建后镜像约 15MB。
+
+```bash
+# 方式一：docker build
+docker build -t llm-gateway .
+mkdir -p config
+docker run -d --name llm-gateway \
+  -p 8318:8318 \
+  -v "$(pwd)/config:/config" \
+  llm-gateway
+
+# 方式二：docker compose
+mkdir -p config
+docker compose up -d
+```
+
+首次运行会在 `config/` 目录生成默认 `config.json`，编辑后重启容器生效。容器内监听 `0.0.0.0:8318`（通过 `-host 0.0.0.0` 覆盖），宿主机访问 `http://127.0.0.1:8318/`。
+
 ## 配置说明
 
 `config.json` 结构：
@@ -167,6 +187,30 @@ Claude Code 发 `/v1/messages`，网关转成 OpenAI 格式转发到配置的上
 | `/api/logs/clear` | POST | 清空日志 |
 
 若配置了 `admin_key`，管理 API（除 `/api/info`）需带 `Authorization: Bearer <admin_key>`，H5 界面会提示输入。
+
+## 项目结构
+
+采用 Go 社区标准布局（`cmd/` + `internal/` + 同目录测试）：
+
+```text
+llm-gateway/
+├── cmd/llm-gateway/          # 可执行入口（main）
+│   └── main.go
+├── internal/                 # 私有实现（模块外无法 import）
+│   ├── config/               # 配置加载、存储、路由解析
+│   ├── convert/              # 协议转换（chat/messages/responses + 流式）
+│   ├── gateway/              # 网关核心（转发、重试、failover）
+│   └── web/                  # 内嵌 H5 管理界面
+├── Dockerfile                # 多阶段构建
+├── docker-compose.yml
+├── go.mod
+└── README.md
+```
+
+说明：
+
+- **`internal/`**：Go 强制语义，该目录下的包只能被本模块代码导入，是对外私有实现。
+- **测试同目录**：Go 惯例是测试文件（`*_test.go`）与源码放在同一目录，便于访问包内私有符号，`go test ./...` 自动发现。
 
 ## 与 openai2claude 的关系
 

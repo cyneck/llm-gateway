@@ -19,6 +19,8 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "配置文件路径（默认：程序同目录 config.json）")
+	listenHost := flag.String("host", "", "监听地址（覆盖配置文件，Docker 容器中设为 0.0.0.0）")
+	listenPort := flag.Int("port", 0, "监听端口（覆盖配置文件）")
 	showHelp := flag.Bool("h", false, "显示帮助")
 	flag.Parse()
 
@@ -43,6 +45,14 @@ func main() {
 
 	g := gateway.New(store)
 	cfg := store.Get()
+
+	// 命令行覆盖监听地址（Docker 容器中需监听 0.0.0.0）
+	if *listenHost != "" {
+		cfg.Listen.Host = *listenHost
+	}
+	if *listenPort != 0 {
+		cfg.Listen.Port = *listenPort
+	}
 
 	mux := http.NewServeMux()
 
@@ -85,6 +95,8 @@ func printUsage() {
 	fmt.Println()
 	fmt.Println("选项:")
 	fmt.Println("  -config string   配置文件路径（默认：程序同目录 config.json）")
+	fmt.Println("  -host string     监听地址（覆盖配置文件，Docker 中设为 0.0.0.0）")
+	fmt.Println("  -port int        监听端口（覆盖配置文件）")
 	fmt.Println("  -h               显示帮助")
 	fmt.Println()
 	fmt.Println("首次运行会自动生成默认 config.json，修改后重启生效，")

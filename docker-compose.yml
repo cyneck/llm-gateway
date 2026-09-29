@@ -1,0 +1,10 @@
+services:
+  llm-gateway:
+    build: .
+    container_name: llm-gateway
+    ports:
+      - "8318:8318"
+    volumes:
+      # 宿主机 ./config 目录存放 config.json（首次运行会生成默认配置）
+      - ./config:/config
+    restart: unless-stopped
