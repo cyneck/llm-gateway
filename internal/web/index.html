@@ -106,6 +106,7 @@
     <div class="sub">本地多模型 API 网关 · OpenAI ↔ Anthropic 双向互转</div>
   </div>
   <div class="actions">
+    <input id="admin-key" type="password" placeholder="admin key（如已配置）" style="width:180px;background:var(--panel2);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 10px;font-size:13px;">
     <button class="ghost" onclick="checkHealth()">健康检查</button>
     <button class="ghost" onclick="loadLogs()">刷新日志</button>
     <button onclick="saveConfig()">保存全部</button>
@@ -158,8 +159,25 @@
 <script>
 let config = null;
 
+function adminHeaders() {
+  const key = document.getElementById('admin-key').value.trim();
+  if (key) return { 'Authorization': 'Bearer ' + key };
+  return {};
+}
+
 async function api(path, opts) {
+  opts = opts || {};
+  opts.headers = Object.assign({}, opts.headers || {}, adminHeaders());
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    const key = prompt('管理 API 需要 admin key，请输入：');
+    if (key) {
+      document.getElementById('admin-key').value = key;
+      opts.headers = Object.assign({}, opts.headers || {}, { 'Authorization': 'Bearer ' + key });
+      return api(path, opts);
+    }
+    throw new Error('unauthorized');
+  }
   return res.json();
 }
 
@@ -334,7 +352,7 @@ async function checkHealth() {
 
 async function testUpstream(i) {
   const up = config.upstreams[i];
-  const res = await fetch('/api/health');
+  const res = await fetch('/api/health', { headers: adminHeaders() });
   const results = await res.json();
   const r = results[i];
   if (r) {
@@ -368,7 +386,7 @@ async function loadLogs() {
 }
 
 async function clearLogs() {
-  await fetch('/api/logs/clear', { method: 'POST' });
+  await fetch('/api/logs/clear', { method: 'POST', headers: adminHeaders() });
   await loadLogs();
   toast('日志已清空');
 }

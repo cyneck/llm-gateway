@@ -5,7 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"llm-gateway/internal/config"
 )
@@ -255,5 +257,126 @@ func TestEndToEnd_ResponsesEntryStream(t *testing.T) {
 	}
 	if strings.Join(textDeltas, "") != "流式内容" {
 		t.Errorf("流式文本聚合错误: %v", textDeltas)
+	}
+}
+
+// 测试 429 自动重试：第一次 429，第二次 200
+func TestEndToEnd_Retry429(t *testing.T) {
+	retryBaseDelay = 10 * time.Millisecond
+	defer func() { retryBaseDelay = time.Second }()
+
+	var count atomic.Int32
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c := count.Add(1)
+		if c == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": "rate_limited"})
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-1", "object": "chat.completion", "model": "m",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "ok"}, "finish_reason": "stop"}},
+		})
+	}))
+	defer mockUpstream.Close()
+
+	store := &config.Store{}
+	store.SetForTest(&config.Config{
+		Listen: config.Listen{Host: "127.0.0.1", Port: 0},
+		Upstreams: []config.Upstream{
+			{Name: "mock", Protocol: "openai", BaseURL: mockUpstream.URL, APIKey: "sk", Models: []string{"m"}, MaxRetries: 2},
+		},
+		Routes: map[string]string{},
+	})
+	g := New(store)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	g.HandleOpenAI(rec, req)
+
+	if count.Load() != 2 {
+		t.Errorf("应重试 1 次后成功，实际请求 %d 次", count.Load())
+	}
+	var resp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if resp["object"] != "chat.completion" {
+		t.Errorf("重试后响应错误: %v", resp)
+	}
+}
+
+// 测试 failover：第一个上游 500，第二个上游 200
+func TestEndToEnd_Failover(t *testing.T) {
+	mockBad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": "boom"})
+	}))
+	mockGood := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-2", "object": "chat.completion", "model": "m",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "fallback ok"}, "finish_reason": "stop"}},
+		})
+	}))
+	defer mockBad.Close()
+	defer mockGood.Close()
+
+	store := &config.Store{}
+	store.SetForTest(&config.Config{
+		Listen:   config.Listen{Host: "127.0.0.1", Port: 0},
+		Failover: true,
+		Upstreams: []config.Upstream{
+			{Name: "bad", Protocol: "openai", BaseURL: mockBad.URL, APIKey: "sk", Models: []string{"m"}},
+			{Name: "good", Protocol: "openai", BaseURL: mockGood.URL, APIKey: "sk", Models: []string{"m"}},
+		},
+		Routes: map[string]string{},
+	})
+	g := New(store)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	g.HandleOpenAI(rec, req)
+
+	var resp map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	choices := resp["choices"].([]any)
+	msg := choices[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "fallback ok" {
+		t.Errorf("failover 失败: %v", resp)
+	}
+}
+
+// 测试模型名重写：客户端发 claude-sonnet，实际请求 deepseek-chat 上游且 payload.model 被改写
+func TestEndToEnd_ModelRewrite(t *testing.T) {
+	var receivedModel string
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		receivedModel = body["model"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "chatcmpl-3", "object": "chat.completion", "model": "deepseek-chat",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "hi"}, "finish_reason": "stop"}},
+		})
+	}))
+	defer mockUpstream.Close()
+
+	store := &config.Store{}
+	store.SetForTest(&config.Config{
+		Listen: config.Listen{Host: "127.0.0.1", Port: 0},
+		Upstreams: []config.Upstream{
+			{Name: "deepseek", Protocol: "openai", BaseURL: mockUpstream.URL, APIKey: "sk", Models: []string{"deepseek-chat"}},
+		},
+		Routes: map[string]string{"claude-sonnet-4": "deepseek:deepseek-chat"},
+	})
+	g := New(store)
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	g.HandleOpenAI(rec, req)
+
+	if receivedModel != "deepseek-chat" {
+		t.Errorf("模型名未正确改写: %s", receivedModel)
 	}
 }

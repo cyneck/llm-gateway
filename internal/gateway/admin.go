@@ -11,7 +11,23 @@ import (
 
 // RegisterAdminRoutes 注册管理 API
 func RegisterAdminRoutes(mux *http.ServeMux, store *config.Store, g *Gateway) {
-	// 网关信息
+	auth := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			cfg := store.Get()
+			if cfg.AdminKey != "" {
+				auth := r.Header.Get("Authorization")
+				const prefix = "Bearer "
+				if !strings.HasPrefix(auth, prefix) || auth[len(prefix):] != cfg.AdminKey {
+					w.Header().Set("WWW-Authenticate", "Bearer")
+					writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+					return
+				}
+			}
+			next(w, r)
+		}
+	}
+
+	// 网关信息（不强制鉴权，保持探针友好）
 	mux.HandleFunc("/api/info", func(w http.ResponseWriter, r *http.Request) {
 		cfg := store.Get()
 		writeJSON(w, 200, map[string]any{
@@ -22,7 +38,7 @@ func RegisterAdminRoutes(mux *http.ServeMux, store *config.Store, g *Gateway) {
 	})
 
 	// 读配置
-	mux.HandleFunc("/api/config", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/config", auth(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			writeJSON(w, 200, store.Get())
@@ -40,10 +56,10 @@ func RegisterAdminRoutes(mux *http.ServeMux, store *config.Store, g *Gateway) {
 		default:
 			writeJSON(w, 405, map[string]any{"error": "method not allowed"})
 		}
-	})
+	}))
 
 	// 健康检查
-	mux.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
 		cfg := store.Get()
 		type healthItem struct {
 			Name    string `json:"name"`
@@ -57,22 +73,22 @@ func RegisterAdminRoutes(mux *http.ServeMux, store *config.Store, g *Gateway) {
 			results = append(results, healthItem{Name: up.Name, OK: ok, Detail: detail, Latency: latency})
 		}
 		writeJSON(w, 200, results)
-	})
+	}))
 
 	// 请求日志
-	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/logs", auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, g.logs.List())
-	})
+	}))
 
 	// 清空日志
-	mux.HandleFunc("/api/logs/clear", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/logs/clear", auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			g.logs = NewLogBuffer(300)
 			writeJSON(w, 200, map[string]any{"ok": true})
 			return
 		}
 		writeJSON(w, 405, map[string]any{"error": "method not allowed"})
-	})
+	}))
 }
 
 // probeUpstream 探测上游连通性与鉴权

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -17,18 +18,22 @@ type Listen struct {
 
 // Upstream 一个上游模型服务
 type Upstream struct {
-	Name     string   `json:"name"`     // 唯一标识，如 "claude" / "deepseek"
-	Protocol string   `json:"protocol"` // "openai" 或 "anthropic"
-	BaseURL  string   `json:"base_url"` // 例如 https://api.deepseek.com/v1
-	APIKey   string   `json:"api_key"`  // 上游 API Key
-	Models   []string `json:"models"`   // 该上游提供的模型列表
+	Name           string   `json:"name"`            // 唯一标识，如 "claude" / "deepseek"
+	Protocol       string   `json:"protocol"`        // "openai" 或 "anthropic"
+	BaseURL        string   `json:"base_url"`        // 例如 https://api.deepseek.com/v1
+	APIKey         string   `json:"api_key"`         // 上游 API Key
+	Models         []string `json:"models"`          // 该上游提供的模型列表
+	TimeoutSeconds int      `json:"timeout_seconds"` // 单次上游请求超时（0=不限制）
+	MaxRetries     int      `json:"max_retries"`     // 对 429/5xx/网络错误的重试次数（0=不重试）
 }
 
 // Config 网关完整配置
 type Config struct {
 	Listen    Listen            `json:"listen"`
 	Upstreams []Upstream        `json:"upstreams"`
-	Routes    map[string]string `json:"routes"` // model 名 -> upstream name（可选，缺省时按 Models 自动匹配）
+	Routes    map[string]string `json:"routes"`    // model 名 -> upstream[:target_model]（缺省时按 Models 自动匹配）
+	Failover  bool              `json:"failover"`  // 模型多上游时失败是否自动切换
+	AdminKey  string            `json:"admin_key"` // 管理 API Bearer Token（空=不鉴权）
 }
 
 // Default 生成一份可运行的默认配置
@@ -99,6 +104,14 @@ func normalize(cfg *Config) {
 	if cfg.Routes == nil {
 		cfg.Routes = map[string]string{}
 	}
+	for i := range cfg.Upstreams {
+		if cfg.Upstreams[i].TimeoutSeconds < 0 {
+			cfg.Upstreams[i].TimeoutSeconds = 0
+		}
+		if cfg.Upstreams[i].MaxRetries < 0 {
+			cfg.Upstreams[i].MaxRetries = 0
+		}
+	}
 }
 
 // Get 返回配置快照（深拷贝，避免外部改动）
@@ -147,28 +160,68 @@ func writeConfig(path string, cfg *Config) error {
 	return nil
 }
 
-// ResolveUpstream 根据模型名找到目标上游
-// 优先级：Routes 显式映射 > Upstreams 的 Models 列表 > 唯一上游兜底
-func (s *Store) ResolveUpstream(model string) *Upstream {
+// Target 路由解析结果：上游 + 可改写后的目标模型名
+type Target struct {
+	Upstream    Upstream
+	TargetModel string // 发给上游时使用的模型名；若无需改写则与原模型名相同
+}
+
+// parseRouteValue 解析 "upstream" 或 "upstream:target_model"
+func parseRouteValue(v string) (upstreamName, targetModel string) {
+	if idx := strings.Index(v, ":"); idx >= 0 {
+		return v[:idx], v[idx+1:]
+	}
+	return v, ""
+}
+
+// ResolveUpstreams 根据模型名返回候选上游列表（含目标模型名）
+// 优先级：Routes 显式映射 > Models 自动匹配 > 唯一上游兜底
+func (s *Store) ResolveUpstreams(model string) []Target {
 	cfg := s.Get()
-	if name, ok := cfg.Routes[model]; ok {
+	var out []Target
+
+	// 1. Routes 显式映射
+	if raw, ok := cfg.Routes[model]; ok {
+		upName, target := parseRouteValue(raw)
 		for i := range cfg.Upstreams {
-			if cfg.Upstreams[i].Name == name {
-				return &cfg.Upstreams[i]
+			if cfg.Upstreams[i].Name == upName {
+				tm := target
+				if tm == "" {
+					tm = model
+				}
+				out = append(out, Target{Upstream: cfg.Upstreams[i], TargetModel: tm})
+				return out
 			}
 		}
 	}
+
+	// 2. Models 列表匹配
 	for i := range cfg.Upstreams {
 		for _, m := range cfg.Upstreams[i].Models {
 			if m == model {
-				return &cfg.Upstreams[i]
+				out = append(out, Target{Upstream: cfg.Upstreams[i], TargetModel: model})
+				break
 			}
 		}
 	}
+	if len(out) > 0 {
+		return out
+	}
+
+	// 3. 唯一上游兜底
 	if len(cfg.Upstreams) == 1 {
-		return &cfg.Upstreams[0]
+		return []Target{{Upstream: cfg.Upstreams[0], TargetModel: model}}
 	}
 	return nil
+}
+
+// ResolveUpstream 只返回第一个候选（兼容旧入口）
+func (s *Store) ResolveUpstream(model string) *Upstream {
+	cands := s.ResolveUpstreams(model)
+	if len(cands) == 0 {
+		return nil
+	}
+	return &cands[0].Upstream
 }
 
 // SetForTest 直接注入内存配置（不落盘），仅供测试使用。

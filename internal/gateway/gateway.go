@@ -4,10 +4,12 @@ package gateway
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +68,9 @@ func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
+// retryBaseDelay 测试可调的重试基础间隔
+var retryBaseDelay = time.Second
+
 // forward 通用转发：读请求 -> 路由 -> 转换 -> 转发 -> 处理响应
 func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol string) {
 	start := time.Now()
@@ -100,8 +105,8 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 	model := orString(payload["model"])
 	rec.Model = model
 
-	upstream := g.store.ResolveUpstream(model)
-	if upstream == nil {
+	candidates := g.store.ResolveUpstreams(model)
+	if len(candidates) == 0 {
 		rec.Status = 404
 		rec.Err = "找不到模型对应的上游"
 		writeJSON(w, 404, map[string]any{"error": map[string]any{
@@ -110,79 +115,173 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 		}})
 		return
 	}
-	rec.Upstream = upstream.Name
 
-	// 判断是否需要协议转换（responses 入口无论上游协议都要转换响应，恒为 true）
-	needsConvert := entryProtocol != upstream.Protocol || entryProtocol == "responses"
+	cfg := g.store.Get()
+
+	var lastErr string
+	for ci, cand := range candidates {
+		upstream := cand.Upstream
+		if ci == 0 {
+			rec.Upstream = upstream.Name
+		} else {
+			rec.Upstream = upstream.Name
+			lastErr += "; failed over from " + candidates[ci-1].Upstream.Name
+		}
+
+		// 模型名重写：Routes 值为 "upstream:target_model" 时改写当前候选的 payload.model
+		payloadCopy := shallowCopy(payload)
+		targetModel := model
+		if cand.TargetModel != "" {
+			targetModel = cand.TargetModel
+		}
+		payloadCopy["model"] = targetModel
+
+		conv := convertPayload(payloadCopy, entryProtocol, upstream.Protocol)
+		rec.Convert = conv.label
+
+		targetURL := upstreamTarget(&upstream)
+		reqBody, _ := json.Marshal(conv.payload)
+
+		maxRetries := upstream.MaxRetries
+		if maxRetries < 0 {
+			maxRetries = 0
+		}
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			resp, err := g.doUpstream(r.Context(), upstream, targetURL, reqBody)
+			if err == nil && resp != nil {
+				rec.Status = resp.StatusCode
+				rec.UpstreamURL = targetURL
+
+				isStream := false
+				if s, ok := conv.payload["stream"].(bool); ok {
+					isStream = s
+				}
+
+				// 成功响应：直接处理并返回
+				if resp.StatusCode < 400 {
+					if attempt > 0 {
+						lastErr += fmt.Sprintf("; retried %d times", attempt)
+					}
+					if lastErr != "" {
+						rec.Err = strings.TrimPrefix(lastErr, "; ")
+					}
+					if isStream {
+						g.proxyStream(w, resp, entryProtocol, upstream.Protocol, conv.needsConvert)
+					} else {
+						g.proxyNonStream(w, resp, entryProtocol, upstream.Protocol, conv.needsConvert)
+					}
+					return
+				}
+
+				// 4xx（除 429）不重试，直接透传
+				if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(resp.StatusCode)
+					_, _ = io.Copy(w, resp.Body)
+					rec.Err = "上游返回 " + resp.Status
+					_ = resp.Body.Close()
+					return
+				}
+
+				// 可重试错误：读 body 消耗掉，准备下一轮
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+
+				// 重试耗尽则进入 failover
+				if attempt == maxRetries {
+					lastErr += fmt.Sprintf("; %s returned %s", upstream.Name, resp.Status)
+					break
+				}
+
+				// 退避
+				delay := retryBaseDelay * time.Duration(1<<attempt)
+				if resp.StatusCode == http.StatusTooManyRequests {
+					if ra := resp.Header.Get("Retry-After"); ra != "" {
+						if sec, e := strconv.Atoi(ra); e == nil && sec > 0 {
+							delay = time.Duration(sec) * time.Second
+						}
+					}
+				}
+				time.Sleep(delay)
+				continue
+			}
+
+			// 网络错误
+			if attempt == maxRetries {
+				lastErr += fmt.Sprintf("; %s unreachable: %s", upstream.Name, err.Error())
+				break
+			}
+			time.Sleep(retryBaseDelay * time.Duration(1<<attempt))
+		}
+
+		// failover 关闭
+		if !cfg.Failover || len(candidates) == 1 {
+			break
+		}
+	}
+
+	// 全部候选失败
+	rec.Status = 502
+	if lastErr != "" {
+		rec.Err = strings.TrimPrefix(lastErr, "; ")
+	} else {
+		rec.Err = "上游全部失败"
+	}
+	writeJSON(w, 502, map[string]any{"error": map[string]any{
+		"message": rec.Err, "type": "upstream_error",
+	}})
+}
+
+// convertResult 请求协议转换结果
+type convertResult struct {
+	payload      map[string]any
+	needsConvert bool
+	label        string
+}
+
+// convertPayload 根据入口与上游协议转换请求体
+func convertPayload(payload map[string]any, entryProtocol, upstreamProtocol string) convertResult {
+	needsConvert := entryProtocol != upstreamProtocol || entryProtocol == "responses"
+	r := convertResult{payload: payload, needsConvert: needsConvert}
 	switch {
 	case entryProtocol == "responses":
-		// Responses -> Chat Completions，复用现有链路
 		payload = convert.ReqResponsesToOpenAI(payload)
-		if upstream.Protocol == "anthropic" {
+		if upstreamProtocol == "anthropic" {
 			payload = convert.ReqOpenAIToAnthropic(payload)
-			rec.Convert = "responses→anthropic"
+			r.label = "responses→anthropic"
 		} else {
-			rec.Convert = "responses→openai"
+			r.label = "responses→openai"
 		}
-	case entryProtocol == "openai" && upstream.Protocol == "anthropic":
+	case entryProtocol == "openai" && upstreamProtocol == "anthropic":
 		payload = convert.ReqOpenAIToAnthropic(payload)
-		rec.Convert = "openai→anthropic"
-	case entryProtocol == "anthropic" && upstream.Protocol == "openai":
+		r.label = "openai→anthropic"
+	case entryProtocol == "anthropic" && upstreamProtocol == "openai":
 		payload = convert.ReqAnthropicToOpenAI(payload)
-		rec.Convert = "anthropic→openai"
+		r.label = "anthropic→openai"
+	}
+	r.payload = payload
+	return r
+}
+
+// doUpstream 对单个上游执行一次请求，带超时
+func (g *Gateway) doUpstream(ctx context.Context, up config.Upstream, targetURL string, reqBody []byte) (*http.Response, error) {
+	var reqCtx context.Context = ctx
+	var cancel context.CancelFunc
+	if up.TimeoutSeconds > 0 {
+		reqCtx, cancel = context.WithTimeout(ctx, time.Duration(up.TimeoutSeconds)*time.Second)
+		defer cancel()
 	}
 
-	// 拼目标 URL
-	targetURL := upstreamTarget(upstream)
-	reqBody, _ := json.Marshal(payload)
-
-	req, err := http.NewRequestWithContext(r.Context(), "POST", targetURL, bytes.NewReader(reqBody))
+	req, err := http.NewRequestWithContext(reqCtx, "POST", targetURL, bytes.NewReader(reqBody))
 	if err != nil {
-		rec.Status = 500
-		rec.Err = "构造上游请求失败"
-		writeJSON(w, 500, map[string]any{"error": map[string]any{"message": "internal error", "type": "internal_error"}})
-		return
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
-	if upstream.Protocol == "anthropic" {
+	req.Header.Set("Authorization", "Bearer "+up.APIKey)
+	if up.Protocol == "anthropic" {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
-
-	rec.UpstreamURL = targetURL
-
-	// 判断流式
-	isStream := false
-	if s, ok := payload["stream"].(bool); ok {
-		isStream = s
-	}
-
-	resp, err := g.client.Do(req)
-	if err != nil {
-		rec.Status = 502
-		rec.Err = "上游连接失败: " + err.Error()
-		writeJSON(w, 502, map[string]any{"error": map[string]any{
-			"message": "upstream unreachable: " + err.Error(), "type": "upstream_error",
-		}})
-		return
-	}
-	defer resp.Body.Close()
-	rec.Status = resp.StatusCode
-
-	// 上游报错：透传
-	if resp.StatusCode >= 400 {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
-		rec.Err = "上游返回 " + resp.Status
-		return
-	}
-
-	if isStream {
-		g.proxyStream(w, resp, entryProtocol, upstream.Protocol, needsConvert)
-	} else {
-		g.proxyNonStream(w, resp, entryProtocol, upstream.Protocol, needsConvert)
-	}
+	return g.client.Do(req)
 }
 
 // proxyNonStream 非流式响应转发（含协议转换）
@@ -349,4 +448,13 @@ func orString(v any) string {
 		return s
 	}
 	return ""
+}
+
+// shallowCopy 浅拷贝 map[string]any
+func shallowCopy(m map[string]any) map[string]any {
+	cp := make(map[string]any, len(m))
+	for k, v := range m {
+		cp[k] = v
+	}
+	return cp
 }
