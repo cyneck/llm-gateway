@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -30,6 +31,10 @@ func New(store *config.Store) *Gateway {
 		store: store,
 		client: &http.Client{
 			Transport: &http.Transport{
+				// 统一出站代理：每次请求实时读取配置，保存后立即生效，无需重启
+				Proxy: func(req *http.Request) (*url.URL, error) {
+					return store.Get().Proxy.ProxyFor(req.URL.Hostname())
+				},
 				MaxIdleConns:        64,
 				MaxIdleConnsPerHost: 16,
 				IdleConnTimeout:     90 * time.Second,
@@ -55,17 +60,118 @@ func (g *Gateway) HandleResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleModels 处理 /v1/models
+//
+// 默认返回配置文件中的静态模型清单；带 ?live=1 时额外向上游拉取实时模型列表：
+// openai/anthropic 协议走各自 /models 端点（需要 API Key）；
+// openai-official 走官方清单端点，凭证取客户端 Authorization 或本机 Codex 登录态。
 func (g *Gateway) HandleModels(w http.ResponseWriter, r *http.Request) {
 	cfg := g.store.Get()
 	data := make([]any, 0)
+	seen := map[string]bool{}
+	add := func(id, owner string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		data = append(data, map[string]any{"id": id, "object": "model", "owned_by": owner})
+	}
+
 	for _, up := range cfg.Upstreams {
 		for _, m := range up.Models {
-			data = append(data, map[string]any{
-				"id": m, "object": "model", "owned_by": up.Name,
-			})
+			add(m, up.Name)
 		}
 	}
+
+	if r.URL.Query().Get("live") == "1" {
+		for i := range cfg.Upstreams {
+			up := cfg.Upstreams[i]
+
+			// 官方透传上游本身没有 API Key（凭证由客户端请求带来或读本机登录态），
+			// 因此必须排在下方的 APIKey 守卫之前，否则会被误判为"不可探测"而跳过。
+			if up.Protocol == config.ProtocolOfficial {
+				models, err := g.fetchOfficialModels(r.Context(), up.BaseURL, r.Header.Get("Authorization"))
+				if err != nil {
+					g.logs.Add(&ReqRecord{
+						Time: time.Now(), Method: r.Method, Path: r.URL.Path,
+						Entry: "models", Upstream: up.Name,
+						UpstreamURL: officialModelsURL(up.BaseURL),
+						Status: 0, Err: "官方模型清单拉取失败：" + err.Error(),
+					})
+					// 拉取失败时保留配置里的静态清单，保证模型不会凭空消失
+					for _, m := range up.Models {
+						add(m, up.Name)
+					}
+				}
+				for _, id := range models {
+					add(id, up.Name)
+				}
+				continue
+			}
+
+			if up.APIKey == "" {
+				continue
+			}
+			for _, id := range g.fetchUpstreamModels(r.Context(), &up) {
+				add(id, up.Name)
+			}
+		}
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// upstreamModelsURL 计算上游模型列表端点
+func upstreamModelsURL(up *config.Upstream) string {
+	base := strings.TrimRight(up.BaseURL, "/")
+	if up.Protocol == "anthropic" {
+		return base + "/v1/models"
+	}
+	return base + "/models"
+}
+
+// fetchUpstreamModels 向上游拉取模型列表，失败时静默降级为空列表（不影响静态清单）
+func (g *Gateway) fetchUpstreamModels(ctx context.Context, up *config.Upstream) []string {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamModelsURL(up), nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Authorization", "Bearer "+up.APIKey)
+	if up.Protocol == "anthropic" {
+		req.Header.Set("x-api-key", up.APIKey)
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil
+	}
+
+	// OpenAI: {"data":[{"id":"..."}]}  Anthropic: {"data":[{"id":"..."}]}
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(parsed.Data))
+	for _, m := range parsed.Data {
+		out = append(out, m.ID)
+	}
+	return out
 }
 
 // retryBaseDelay 测试可调的重试基础间隔
@@ -84,6 +190,9 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 		rec.Duration = time.Since(start)
 		g.logs.Add(rec)
 	}()
+
+	// 客户端原始请求头（官方透传时整份带过去）
+	srcHeaders := r.Header.Clone()
 
 	// 读请求体
 	body, err := io.ReadAll(r.Body)
@@ -147,7 +256,7 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 			maxRetries = 0
 		}
 		for attempt := 0; attempt <= maxRetries; attempt++ {
-			resp, err := g.doUpstream(r.Context(), upstream, targetURL, reqBody)
+			resp, err := g.doUpstream(r.Context(), upstream, targetURL, reqBody, srcHeaders)
 			if err == nil && resp != nil {
 				rec.Status = resp.StatusCode
 				rec.UpstreamURL = targetURL
@@ -177,8 +286,16 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, entryProtocol 
 				if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(resp.StatusCode)
-					_, _ = io.Copy(w, resp.Body)
 					rec.Err = "上游返回 " + resp.Status
+					if upstream.Protocol == config.ProtocolOfficial && (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) {
+						// 官方通道被拒：网关只做透传、不注入凭证，问题一定在客户端登录态或账号套餐上，
+						// 这里把排查方向直接写进返回体和日志，避免只看到一个干巴巴的 Unauthorized。
+						body, _ := io.ReadAll(resp.Body)
+						_, _ = w.Write(augmentOfficialAuthError(body))
+						rec.Err += "（官方通道：凭证由客户端自带，网关未注入，请检查账号套餐/登录态）"
+					} else {
+						_, _ = io.Copy(w, resp.Body)
+					}
 					_ = resp.Body.Close()
 					return
 				}
@@ -241,6 +358,10 @@ type convertResult struct {
 
 // convertPayload 根据入口与上游协议转换请求体
 func convertPayload(payload map[string]any, entryProtocol, upstreamProtocol string) convertResult {
+	// 官方透传：原样透传，不做协议转换（官方支持 Responses 协议）
+	if upstreamProtocol == config.ProtocolOfficial {
+		return convertResult{payload: payload, needsConvert: false, label: "官方透传"}
+	}
 	needsConvert := entryProtocol != upstreamProtocol || entryProtocol == "responses"
 	r := convertResult{payload: payload, needsConvert: needsConvert}
 	switch {
@@ -263,8 +384,27 @@ func convertPayload(payload map[string]any, entryProtocol, upstreamProtocol stri
 	return r
 }
 
+// hopByHopHeaders 逐跳头：只在单条连接上有意义，不能跨连接转发（RFC 7230 6.1）
+var hopByHopHeaders = map[string]bool{
+	"connection":          true,
+	"keep-alive":          true,
+	"proxy-authenticate":  true,
+	"proxy-authorization": true,
+	"te":                  true,
+	"trailer":             true,
+	"transfer-encoding":   true,
+	"upgrade":             true,
+	"host":                true, // 由上游 URL 重新决定
+	"content-length":      true, // 由 Go 按实际请求体重算
+}
+
 // doUpstream 对单个上游执行一次请求，带超时
-func (g *Gateway) doUpstream(ctx context.Context, up config.Upstream, targetURL string, reqBody []byte) (*http.Response, error) {
+//
+// srcHeaders 为客户端原始请求头。官方透传（openai-official）时**整份复制**过去：
+// 官方端点要靠 ChatGPT-Account-Id、originator、session_id 等头识别请求，
+// 只保留 Authorization 会被判为未授权。第三方上游则只注入自己的 API Key，
+// 避免把客户端凭证泄露给外部服务。
+func (g *Gateway) doUpstream(ctx context.Context, up config.Upstream, targetURL string, reqBody []byte, srcHeaders http.Header) (*http.Response, error) {
 	var reqCtx context.Context = ctx
 	var cancel context.CancelFunc
 	if up.TimeoutSeconds > 0 {
@@ -277,11 +417,46 @@ func (g *Gateway) doUpstream(ctx context.Context, up config.Upstream, targetURL 
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+up.APIKey)
+
+	if up.Protocol == config.ProtocolOfficial {
+		// 官方透传：原样带上客户端的全部非逐跳头，凭证由客户端自带的为准
+		for name, values := range srcHeaders {
+			if hopByHopHeaders[strings.ToLower(name)] {
+				continue
+			}
+			for _, v := range values {
+				req.Header.Add(name, v)
+			}
+		}
+		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req.Header.Set("Authorization", "Bearer "+up.APIKey)
+	}
 	if up.Protocol == "anthropic" {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
 	return g.client.Do(req)
+}
+
+// officialAuthHint 是官方通道返回 401/403 时附加的排查说明。
+// 网关对官方通道只做透传、不注入任何凭证，所以被拒与网关配置无关。
+const officialAuthHint = "llm-gateway 对官方通道只透传客户端自带的凭证，未做任何改写。" +
+	"被拒通常意味着：1) ChatGPT 账号套餐不含 Codex 权限（免费账号无权调用推理接口，只能查模型列表）；" +
+	"2) 登录态过期，需重新 codex login；3) 上游风控。可先用 /api/official-models/refresh 验证登录态是否仍然有效。"
+
+// augmentOfficialAuthError 把官方通道的鉴权失败响应补上排查提示。
+// 能解析成 JSON 就加一个 hint 字段；解析不了就原样返回，绝不丢原始错误信息。
+func augmentOfficialAuthError(body []byte) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil || m == nil {
+		return body
+	}
+	m["hint"] = officialAuthHint
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // proxyNonStream 非流式响应转发（含协议转换）
@@ -432,6 +607,8 @@ func upstreamTarget(up *config.Upstream) string {
 	switch up.Protocol {
 	case "anthropic":
 		return base + "/v1/messages"
+	case config.ProtocolOfficial:
+		return base + "/responses" // ChatGPT 官方 Codex 端点
 	default: // openai
 		return base + "/chat/completions"
 	}

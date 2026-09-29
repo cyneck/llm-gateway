@@ -74,6 +74,14 @@
   .dot.ok { background: var(--green); }
   .dot.fail { background: var(--red); }
   .dot.unknown { background: var(--muted); }
+  /* 系统内置上游：只读标识 */
+  .badge.builtin { background: #2a2440; color: #b39ddb; border-color: #4a3f6b; }
+  .model-list {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; font-size: 12px; color: var(--muted);
+    word-break: break-all; max-height: 120px; overflow-y: auto;
+  }
+  input[readonly], input:disabled { opacity: .65; cursor: not-allowed; }
   .proto-tag { font-size: 11px; padding: 2px 8px; border-radius: 4px; }
   .proto-openai { background: #1a3a5c; color: #6db3ff; }
   .proto-anthropic { background: #3c2a1a; color: #e8a95c; }
@@ -126,6 +134,25 @@
     </div>
   </div>
   <div class="muted" style="font-size:12px;">修改监听设置后需重启网关才能生效（保存仅写入配置文件）。</div>
+</div>
+
+<div class="panel">
+  <h2>统一出站代理</h2>
+  <div class="muted" style="font-size:12px;margin-bottom:12px;">
+    网关访问<strong>所有上游</strong>时都会走这个代理。上游在境外（如 chatgpt.com）时需要配置；
+    留空则直连。保存后<strong>立即生效，无需重启</strong>。
+  </div>
+  <div class="row">
+    <div class="field">
+      <label>代理地址</label>
+      <input class="mono" id="proxy-url" placeholder="http://127.0.0.1:7897">
+    </div>
+    <div class="field">
+      <label>不走代理的主机（逗号分隔）</label>
+      <input class="mono" id="proxy-no-proxy" placeholder="localhost,127.0.0.1">
+    </div>
+  </div>
+  <div class="muted" style="font-size:12px;">容器内运行时，<code>127.0.0.1</code> 指容器自身而非宿主机，需填宿主机可达地址。</div>
 </div>
 
 <div class="panel">
@@ -192,6 +219,10 @@ async function loadConfig() {
   config = await api('/api/config');
   document.getElementById('listen-host').value = config.listen.host;
   document.getElementById('listen-port').value = config.listen.port;
+  // 代理字段可能缺失（旧配置文件），补齐后再渲染
+  config.proxy = config.proxy || {};
+  document.getElementById('proxy-url').value = config.proxy.url || '';
+  document.getElementById('proxy-no-proxy').value = config.proxy.no_proxy || '';
   renderUpstreams();
   renderRoutes();
 }
@@ -202,12 +233,50 @@ function protoTag(p) {
     : '<span class="proto-tag proto-openai">OpenAI</span>';
 }
 
+// isBuiltin 系统内置上游：官方透传通道，无 API Key、模型从官方拉取、只读
+function isBuiltin(up) {
+  return up.protocol === 'openai-official';
+}
+
 function renderUpstreams() {
   const box = document.getElementById('upstreams');
   box.innerHTML = '';
   config.upstreams.forEach((up, i) => {
     const card = document.createElement('div');
     card.className = 'upstream-card';
+    if (isBuiltin(up)) {
+      card.innerHTML = `
+        <div class="upstream-head">
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span class="name">${esc(up.name)}</span>
+            ${protoTag(up.protocol)}
+            <span class="badge builtin">系统内置 · 只读</span>
+            <span class="badge">${up.models.length} 个模型</span>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="ghost small" onclick="refreshOfficialModels(${i})">刷新模型</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>Base URL（官方透传端点，不可修改）</label>
+          <input class="mono" value="${esc(up.base_url)}" readonly disabled>
+        </div>
+        <div class="field">
+          <label>凭证</label>
+          <div class="muted" style="font-size:12px;">
+            无需 API Key —— 使用 Codex 客户端的订阅凭证原样透传。
+            模型清单由网关向官方 <code>/models</code> 实时拉取（5 分钟缓存），
+            拉取失败时回退到下列静态列表。
+          </div>
+        </div>
+        <div class="field">
+          <label>模型（自动拉取）</label>
+          <div class="mono model-list" id="builtin-models-${i}">${esc(up.models.join(', ')) || '（空）'}</div>
+        </div>
+      `;
+      box.appendChild(card);
+      return;
+    }
     card.innerHTML = `
       <div class="upstream-head">
         <div style="display:flex;align-items:center;gap:8px;">
@@ -252,6 +321,27 @@ function renderUpstreams() {
     `;
     box.appendChild(card);
   });
+}
+
+async function refreshOfficialModels(i) {
+  const el = document.getElementById(`builtin-models-${i}`);
+  const original = el ? el.textContent : '';
+  if (el) el.textContent = '正在从官方拉取…';
+  try {
+    const res = await fetch('/api/official-models/refresh', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      config.upstreams[i].models = data.models;
+      if (el) el.textContent = data.models.join(', ');
+      toast(`已从官方拉取 ${data.count} 个模型`);
+      return;
+    }
+    if (el) el.textContent = original;
+    toast(data.detail || '拉取失败，仍使用静态列表');
+  } catch (e) {
+    if (el) el.textContent = original;
+    toast('刷新失败: ' + e.message);
+  }
 }
 
 function renderRoutes() {
@@ -327,6 +417,9 @@ function toggleKey(btn) {
 async function saveConfig() {
   config.listen.host = document.getElementById('listen-host').value;
   config.listen.port = parseInt(document.getElementById('listen-port').value) || 8318;
+  config.proxy = config.proxy || {};
+  config.proxy.url = document.getElementById('proxy-url').value.trim();
+  config.proxy.no_proxy = document.getElementById('proxy-no-proxy').value.trim();
   const res = await fetch('/api/config', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

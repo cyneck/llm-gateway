@@ -7,4 +7,14 @@ services:
     volumes:
       # 宿主机 ./config 目录存放 config.json（首次运行会生成默认配置）
       - ./config:/config
+      # 可选：挂载 Codex 登录态，让网关能主动拉取官方模型清单（只读）。
+      # 不挂载也能正常工作 —— 此时官方模型清单改为复用 Codex 客户端请求里的凭证。
+      - ~/.codex:/root/.codex:ro
+    # 让容器能访问宿主机上的代理（如 Clash 的 7897 端口）。
+    # 容器内 127.0.0.1 是它自己的回环，必须走 host.docker.internal 才能到宿主机。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # 容器内 Codex 配置目录（与上面的挂载点对应）
+      - CODEX_HOME=/root/.codex
     restart: unless-stopped
